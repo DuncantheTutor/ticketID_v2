@@ -1,0 +1,203 @@
+body[data-app="receiver"] { background: var(--bg); }
+
+#app { min-height: 100dvh; }
+
+.poster {
+  min-height: 100dvh;
+  background: #000 center/cover no-repeat;
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  pointer-events: none;
+  user-select: none;
+}
+
+.mast {
+  padding: 0.7rem 1rem 0.45rem;
+  text-align: center;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.72), transparent);
+}
+
+.event-name {
+  margin: 0.55rem 0 0;
+  padding: 0 5rem;
+  text-align: center;
+  color: #fff;
+  font-size: clamp(1.35rem, 4vw, 2rem);
+  font-weight: 650;
+  line-height: 1.2;
+  text-shadow: 0 1px 2px #000;
+}
+
+.finder-wrap {
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  padding: 0.6rem;
+}
+
+.finder {
+  position: relative;
+  width: min(68vw, 52vh, 420px);
+  aspect-ratio: 1;
+  border-radius: 22px;
+  overflow: hidden;
+  background: #000;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+}
+
+.finder video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  background: #000;
+}
+
+.finder video.mirror { transform: scaleX(-1); }
+
+.powered {
+  margin: 0;
+  color: #fff;
+  font-size: 0.82rem;
+  letter-spacing: -0.03em;
+  pointer-events: none;
+  text-shadow: 0 1px 2px #000;
+}
+
+.powered span { color: var(--teal); }
+
+.scan-foot {
+  position: relative;
+  z-index: 5;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.78), transparent);
+  padding: 0.2rem 1rem 1.1rem;
+}
+
+.scan-line {
+  margin: 0;
+  padding: 0.2rem 1.5rem 0.45rem;
+  text-align: center;
+  color: #fff;
+  font-size: clamp(1.45rem, 4vw, 2.2rem);
+}
+
+.get-app { color: #fff; text-align: center; pointer-events: auto; }
+
+.get-app > p { margin: 0 0 0.4rem; font-size: 0.95rem; }
+
+.store-row { display: flex; justify-content: center; gap: 0.7rem; }
+
+.store-row button {
+  width: 2.8rem;
+  height: 2.8rem;
+  border: 0;
+  border-radius: 0.7rem;
+  background: #fff;
+  color: #111;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+
+.store-row button[aria-pressed="true"] { outline: 2px solid var(--teal); outline-offset: 2px; }
+
+.store-row svg { width: 1.45rem; height: 1.45rem; display: block; }
+
+.store-reveal:not(:empty) {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  background: #000;
+  pointer-events: auto;
+}
+
+.store-reveal img {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  display: block;
+  object-fit: contain;
+  background: #f3f1ea;
+  padding: 0.85rem;
+  box-sizing: border-box;
+}
+
+.powered, .leave, .flip, .lock { z-index: 6; }
+
+.poster.is-locked .get-app { pointer-events: none; opacity: 0.4; }
+
+.poster.is-success {
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+}
+
+.success-line {
+  margin: 0;
+  max-width: 16em;
+  color: #fff;
+  text-align: center;
+  font-size: clamp(1.6rem, 4.4vw, 2.5rem);
+  line-height: 1.3;
+  text-shadow: 0 2px 10px #000;
+}
+
+.poster.is-locked .leave,
+.poster.is-locked .flip { pointer-events: none; opacity: 0.4; }
+
+.pin-pad {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 0.85rem;
+  padding: 1.5rem;
+  background: rgba(0, 0, 0, 0.78);
+  pointer-events: auto;
+}
+
+.pin-title { margin: 0; color: #fff; text-align: center; max-width: 16rem; }
+
+.pin-dots { margin: 0; letter-spacing: 0.45rem; color: #fff; font-size: 1.3rem; }
+
+.pin-keys { display: grid; grid-template-columns: repeat(3, 4.2rem); gap: 0.55rem; }
+
+.pin-keys button {
+  height: 3.4rem;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-size: 1.3rem;
+}
+
+.pin-keys button[data-digit="0"] { grid-column: 2; }
+
+.leave, .flip, .lock {
+  position: absolute;
+  top: 2.15rem;
+  z-index: 2;
+  width: 2.6rem;
+  height: 2.6rem;
+  border: 0;
+  background: none;
+  color: #fff;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  pointer-events: auto;
+  filter: drop-shadow(0 1px 1px #000);
+}
+
+.leave { left: 1rem; font-size: 1.7rem; line-height: 1; }
+
+.lock { left: 3.8rem; }
+
+.lock svg, .flip svg { width: 1.7rem; height: 1.7rem; display: block; }
+
+.flip { right: 1rem; }
