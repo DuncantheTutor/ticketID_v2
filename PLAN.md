@@ -66,9 +66,9 @@ From the dashboard they create gigs, confirm who is on the bill, open the receiv
 
 A fan signs up with a username, an email address, and a phone number. Hometown and city are optional. If they are left blank, the app says they will get codes for upcoming gigs and tours in their hometown and country if they add those details.
 
-A password exists so they can log back in.
+A password exists so they can log back in. If they forget it, the email link opens ticketID and the new password is chosen there, with the same rules as signup.
 
-The email is verified in the usual way. After signup, a message is sent to that address with a confirmation link and a short code. The account stays closed until the person opens the link or enters the code. The same check applies when a band, venue, or festival registers an email.
+Email verification waits until release. During this stage a fan, band, venue, or festival can sign up and use the account before the address is confirmed. The check itself is listed under Before release.
 
 Hometown and city do one job. They make the account eligible for priority codes aimed at upcoming gigs and tours in that place. They are not a list other organisations can buy.
 
@@ -88,7 +88,7 @@ The other party is added in person, on the night. Each band, venue, and festival
 
 The creator is already on the gig. A venue creating the night adds acts. A band creating the night adds the venue. A festival adds both.
 
-This short code only joins the gig. It is separate from the event id and password that log the receiver in.
+This short code only joins the gig. It is separate from the event id and password that log the receiver in. Joining does not make that organisation the owner. Only the organisation that created the gig can change it, add someone else, take it live, or open the receiver. A new scanner code lets another phone join and leaves phones that are already signed in still signed in. The creator can see those phones and disconnect one of them. A band or venue that was added can see the gig and can still send a priority code to people who registered there.
 
 The gig needs its name and image before anyone can register, because the fan's confirmation is that pair.
 
@@ -126,7 +126,7 @@ If a fan has chosen to hear only from bands they have registered with, a code fr
 
 ## What this version builds
 
-- Fan signup with email verification, a login landing page, and the three screens on a dark teal background: QR, then swipe right to Gigs, then swipe right to Codes, with a settings cog on the QR screen
+- Fan signup, a login landing page, and the three screens on a dark teal background: QR, then swipe right to Gigs, then swipe right to Codes, with a settings cog on the QR screen
 - Gig tiles with the date rule above, and code tiles that use the sender's profile picture
 - Dashboard logins for a band, a venue, and a festival, each with a profile picture
 - Create gig, then name, time, date, bio, and a required image
@@ -135,6 +135,13 @@ If a fan has chosen to hear only from bands they have registered with, a code fr
 - Generate, scan, the fan's named confirmation, and the receiver's poster with **Tap to Register** and **Registration Success**
 - The proved list, as the groups above
 - Sending a priority code, or a venue offer, into the app of the people in an allowed group, honouring the fan's opt-in
+
+## Before release
+
+Required before the app is released. Not part of the current build.
+
+- Email verification. After signup, a message goes to that address with a confirmation link and a short code. The account stays closed until the person opens the link or enters the code. The same check applies to a band, venue, or festival, and again when an account changes its email. Changing the email also requires the current password, and the new address does not take effect until it is confirmed.
+- Phone verification. A phone number belongs to one fan. The number is confirmed before it can be used to recover a password, so a reset cannot land on a different account that entered the same number.
 
 ## What waits
 
@@ -147,7 +154,7 @@ These stay out of this version. No screens and no data model for them yet.
 
 ## Done when
 
-A fan, band, venue, or festival can register an email and confirm it from the message sent to that address. A band or venue can sign in, create a gig with an image, and add the other party by typing a short code from that party's dashboard. A receiver can log in and idle on that image, with the bottom faded to black and **Tap to Register** in white.
+A band or venue can sign in, create a gig with an image, and add the other party by typing a short code from that party's dashboard. A receiver can log in and idle on that image, with the bottom faded to black and **Tap to Register** in white.
 
 A fan can log in and land on the QR screen, swipe right to Gigs and right again to Codes, and open settings from the cog. A fan can generate a code, the receiver can scan it, the phone can show **You registered for {gig_name}**, and the receiver can show **Registration Success**. The gig then appears on the fan's list.
 

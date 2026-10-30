@@ -1,0 +1,17 @@
+{
+  "appId": "app.ticketid.fan",
+  "appName": "ticketID",
+  "webDir": "mobile/www",
+  "android": {
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https",
+    "cleartext": false
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}

@@ -1,0 +1,1 @@
+window.TICKETID_SERVER = window.TICKETID_SERVER || "";

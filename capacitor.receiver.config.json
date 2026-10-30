@@ -1,0 +1,18 @@
+{
+  "appId": "app.ticketid.receiver",
+  "appName": "ticketID Receiver",
+  "webDir": "mobile/receiver",
+  "android": {
+    "path": "android-receiver",
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https",
+    "cleartext": false
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}

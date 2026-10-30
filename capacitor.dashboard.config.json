@@ -1,0 +1,18 @@
+{
+  "appId": "app.ticketid.dashboard",
+  "appName": "ticketID Dashboard",
+  "webDir": "mobile/dashboard",
+  "android": {
+    "path": "android-dashboard",
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https",
+    "cleartext": false
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}

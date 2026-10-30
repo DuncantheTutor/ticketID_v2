@@ -3,11 +3,25 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server/index.js",
-    "test": "node --test server/api.test.js"
+    "start": "node scripts/firebase.mjs",
+    "test": "node scripts/test-firebase.mjs",
+    "test:firebase": "node scripts/test-firebase.mjs",
+    "firebase": "node scripts/firebase.mjs",
+    "app:sync": "node scripts/stage-mobile.mjs && npx cap sync android",
+    "app:apk": "node scripts/stage-mobile.mjs && npx cap sync android && node scripts/assemble-android.mjs && node scripts/copy-apk.mjs",
+    "receiver:apk": "node scripts/stage-mobile.mjs receiver && node scripts/with-receiver-config.mjs capacitor.receiver.config.json npx cap sync android && node scripts/assemble-android.mjs android-receiver && node scripts/copy-apk.mjs android-receiver ticketID-receiver.apk",
+    "dashboard:apk": "node scripts/stage-mobile.mjs dashboard && node scripts/with-receiver-config.mjs capacitor.dashboard.config.json npx cap sync android && node scripts/assemble-android.mjs android-dashboard && node scripts/copy-apk.mjs android-dashboard ticketID-dashboard.apk"
   },
   "dependencies": {
+    "@capacitor/android": "^8.5.3",
+    "@capacitor/cli": "^8.5.3",
+    "@capacitor/core": "^8.5.3",
+    "@capacitor/local-notifications": "^8.3.1",
+    "@capacitor/push-notifications": "^8.1.3",
     "jsqr": "^1.4.0",
     "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "firebase-tools": "^15.34.1"
   }
 }

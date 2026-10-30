@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">ticketID</string>
+    <string name="title_activity_main">ticketID</string>
+    <string name="package_name">app.ticketid.fan</string>
+    <string name="custom_url_scheme">app.ticketid.fan</string>
+</resources>

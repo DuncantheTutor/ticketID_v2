@@ -1,3 +1,7 @@
+import { api, resolve } from "/net.js";
+import { gigDay, isWallClock, wallHasPassed } from "/when.js";
+
+window.TICKETID_ACTOR = "org";
 const tokenKey = "ticketid.org";
 const app = document.querySelector("#app");
 let token = localStorage.getItem(tokenKey);
@@ -11,12 +15,16 @@ let joinCode = "";
 let joinExpires = 0;
 let joinTimer = 0;
 let scanner = null;
+let scanners = [];
 let error = "";
 let notice = "";
 let pendingEmail = sessionStorage.getItem("ticketid.org.pending") || "";
 let hideCompleted = true;
 let draft = blankDraft();
 let sendForm = blankSend();
+let audiencePlaces = { cities: [], countries: [] };
+const heldFiles = { image: "", picture: "" };
+let holdGeneration = 0;
 
 const kinds = [
   ["band", "Band"],
@@ -39,28 +47,120 @@ function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
 }
 
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    method: options.method || "GET",
-    headers: {
-      ...(options.body ? { "content-type": "application/json" } : {}),
-      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.message || "Something went wrong.");
-  return data;
+function passwordRulesHtml() {
+  return `<ul class="rules" aria-live="polite">
+    <li data-rule="length">At least 8 characters</li>
+    <li data-rule="capital">One capital letter</li>
+    <li data-rule="number">One number</li>
+    <li data-rule="symbol">One special character</li>
+    <li data-rule="match">Both passwords match</li>
+  </ul>`;
 }
 
-function fileData(file) {
+function watchPassword(form) {
+  const password = form?.querySelector("[name=password]");
+  const confirm = form?.querySelector("[name=confirm]");
+  if (!password || !confirm) return;
+  const paint = () => {
+    const value = String(password.value || "");
+    const flags = {
+      length: value.length >= 8,
+      capital: /[A-Z]/.test(value),
+      number: /[0-9]/.test(value),
+      symbol: /[^A-Za-z0-9]/.test(value),
+      match: value.length > 0 && value === confirm.value,
+    };
+    form.querySelectorAll("[data-rule]").forEach((item) => item.classList.toggle("is-met", Boolean(flags[item.dataset.rule])));
+  };
+  password.addEventListener("input", paint);
+  confirm.addEventListener("input", paint);
+  paint();
+}
+
+function passwordProblem(password) {
+  const value = String(password ?? "");
+  if (value.length < 8 || !/[A-Z]/.test(value) || !/[0-9]/.test(value) || !/[^A-Za-z0-9]/.test(value)) {
+    return "Use at least 8 characters, with one capital letter, one number, and one special character.";
+  }
+  return "";
+}
+
+function pause(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function loadImage(url) {
   return new Promise((resolve, reject) => {
-    if (!file || !file.size) return resolve("");
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(new Error("That image could not be read."));
-    reader.readAsDataURL(file);
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("That image could not be read."));
+    image.src = url;
   });
+}
+
+async function shrinkImage(blob) {
+  const url = URL.createObjectURL(blob);
+  try {
+    const image = await loadImage(url);
+    const longest = Math.max(image.width, image.height) || 1;
+    const scale = Math.min(1, 1400 / longest);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(image.width * scale));
+    canvas.height = Math.max(1, Math.round(image.height * scale));
+    canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+    let quality = 0.86;
+    let dataUrl = canvas.toDataURL("image/jpeg", quality);
+    while (dataUrl.length > 1_800_000 && quality > 0.5) {
+      quality -= 0.12;
+      dataUrl = canvas.toDataURL("image/jpeg", quality);
+    }
+    return dataUrl;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function readImage(file) {
+  if (!file) return "";
+  let last = new Error("That image could not be read.");
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      const blob = file.slice(0, file.size > 0 ? file.size : undefined, file.type || "image/jpeg");
+      const buffer = await blob.arrayBuffer();
+      if (!buffer.byteLength) throw new Error("That image could not be read.");
+      return await shrinkImage(new Blob([buffer], { type: file.type || "image/jpeg" }));
+    } catch (error) {
+      last = error instanceof Error ? error : last;
+      await pause(70 * 2 ** attempt);
+    }
+  }
+  throw last;
+}
+
+async function holdFile(input) {
+  const generation = ++holdGeneration;
+  const key = input.name === "picture" ? "picture" : "image";
+  const file = input.files && input.files[0];
+  if (!file) {
+    heldFiles[key] = "";
+    return;
+  }
+  try {
+    const data = await readImage(file);
+    if (generation !== holdGeneration) return;
+    heldFiles[key] = data;
+    error = "";
+  } catch (cause) {
+    if (generation !== holdGeneration) return;
+    heldFiles[key] = "";
+    error = cause.message;
+  }
+  render();
+}
+
+function chosenImage(name, file) {
+  if (heldFiles[name]) return Promise.resolve(heldFiles[name]);
+  return readImage(file);
 }
 
 function tours() {
@@ -68,12 +168,21 @@ function tours() {
 }
 
 function places(kind) {
+  const extra = kind === "country" ? audiencePlaces.countries : audiencePlaces.cities;
   const key = kind === "country" ? "country" : "city";
-  return [...new Set(gigs.map((item) => item[key]).filter(Boolean))].sort();
+  return [...new Set([...gigs.map((item) => item[key]).filter(Boolean), ...extra])].sort();
+}
+
+function signedInLabel(iso) {
+  const date = new Date(iso);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${when(iso)}, ${hours}:${minutes}`;
 }
 
 function when(iso) {
   if (!iso) return "Date not set";
+  if (isWallClock(iso)) return gigDay(iso);
   const date = new Date(iso);
   return `${date.getDate()} ${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][date.getMonth()]} ${date.getFullYear()}`;
 }
@@ -85,7 +194,7 @@ function eventChoiceLabel(item) {
 }
 
 function completed(item) {
-  return Boolean(item.startsAt) && new Date(item.startsAt).getTime() < Date.now();
+  return wallHasPassed(item.startsAt);
 }
 
 function canDelete(item) {
@@ -111,7 +220,7 @@ function render() {
     : page === "issued" ? issuedView()
     : page === "profile" ? profileView()
     : homeView();
-  app.innerHTML = `<header class="top"><p class="wordmark">ticket<span>ID</span></p><button class="ghost" id="signout" type="button">Sign out</button></header>${nav()}${body}`;
+  app.innerHTML = `<header class="top"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><button class="ghost" id="signout" type="button">Sign out</button></header>${nav()}${body}`;
   bindApp();
 }
 
@@ -121,7 +230,7 @@ function nav() {
 }
 
 function loginView() {
-  return `<main class="stack"><p class="wordmark">ticket<span>ID</span></p><form class="stack" id="login">
+  return `<main class="stack"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><form class="stack" id="login">
     <label>Email<input name="email" type="email" required></label>
     <label>Password<input name="password" type="password" required></label>
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
@@ -131,12 +240,13 @@ function loginView() {
 }
 
 function signupView() {
-  return `<main class="stack"><p class="wordmark">ticket<span>ID</span></p><form class="stack" id="signup">
+  return `<main class="stack"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><form class="stack" id="signup">
     <label>Account<select name="kind">${kinds.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select></label>
     <label>Name<input name="name" required></label>
     <label>Email<input name="email" type="email" required></label>
-    <label>Password<input name="password" type="password" required></label>
-    <p class="hint">Use at least 8 characters, with one capital letter, one number, and one special character.</p>
+    <label>Password<input name="password" type="password" autocomplete="new-password" required></label>
+    <label>Password again<input name="confirm" type="password" autocomplete="new-password" required></label>
+    ${passwordRulesHtml()}
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
     <button class="primary" type="submit">Create account</button>
     <button class="ghost" id="to-login" type="button">I already have an account</button>
@@ -144,7 +254,7 @@ function signupView() {
 }
 
 function verifyView() {
-  return `<main class="stack"><p class="wordmark">ticket<span>ID</span></p><form class="stack" id="verify">
+  return `<main class="stack"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><form class="stack" id="verify">
     <p>We sent a message to ${esc(pendingEmail)}. Open the link, or enter the code.</p>
     <label>Code<input name="code" required></label>
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
@@ -178,7 +288,8 @@ function createView() {
         <label>Time<input name="time" type="time" value="${esc(draft.time)}"></label>
       </div>
       <label>Bio<textarea name="bio">${esc(draft.bio)}</textarea></label>
-      <label>Picture<input name="image" type="file" accept="image/png,image/jpeg,image/webp" ${draft.copyFrom ? "" : "required"}></label>
+      <label>Picture<input name="image" type="file" accept="image/png,image/jpeg,image/webp" ${draft.copyFrom || heldFiles.image ? "" : "required"}></label>
+      ${heldFiles.image ? `<p class="hint">Picture added.</p>` : ""}
       <div class="row">
         <label>City<input name="city" value="${esc(draft.city)}"></label>
         <label>Country<input name="country" value="${esc(draft.country)}"></label>
@@ -214,7 +325,7 @@ function eventView() {
     ${gig.bio ? `<p>${esc(gig.bio)}</p>` : ""}
     ${gig.tourName ? `<p class="hint">${esc(gig.tourName)}</p>` : ""}
     ${groups.map((role) => `<div><h2>${roleTitle(role)}</h2><p class="members">${gig.members.filter((member) => member.role === role).map((member) => esc(member.name)).join("<br>")}</p></div>`).join("")}
-    <form class="row" id="add-member">
+    ${gig.owner ? `<form class="row" id="add-member">
       <label>Add to event<input name="code" autocapitalize="characters" required></label>
       <button class="primary" type="submit">Add</button>
     </form>
@@ -222,9 +333,12 @@ function eventView() {
       <button class="primary" id="scanner-code" type="button">Generate scanner code</button>
       ${scanner?.gigId === gig.id ? `<p class="join-code">${esc(scanner.code)}</p>
         ${scanner.qr ? `<img class="door-qr" alt="Scanner code" src="${esc(scanner.qr)}">` : ""}
-        <p class="hint">This works once. The scanner types it, or scans it, to join this event. Logging out needs a new code.</p>` : `<p class="hint">A scanner code is created when you ask for one. It is not kept on this page.</p>`}
+        <p class="hint">This code works once, for one new phone. Phones that are already signed in stay signed in.</p>` : `<p class="hint">A scanner code is created when you ask for one. It is not kept on this page.</p>`}
+      <h2>Signed-in scanners</h2>
+      ${scanners.length ? scanners.map((item) => `<div class="row"><span>Signed in ${esc(signedInLabel(item.signedInAt))}</span><button class="ghost" type="button" data-receiver="${esc(item.id)}">Disconnect</button></div>`).join("") : `<p class="hint">No scanners are signed in.</p>`}
+      <p class="hint">A scanner stays signed in for 24 hours. Disconnect it here to end it sooner.</p>
     </div>` : `<button class="primary" id="go-live" type="button">Go live</button>`}
-    ${canDelete(gig) ? `<button class="ghost" id="delete-event" type="button">Delete event</button>` : ""}
+    ${canDelete(gig) ? `<button class="ghost" id="delete-event" type="button">Delete event</button>` : ""}` : ""}
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
     ${notice ? `<p class="hint">${esc(notice)}</p>` : ""}
   </section>`;
@@ -248,7 +362,7 @@ function sendView() {
       <option value="places" ${sendForm.type === "places" ? "selected" : ""}>Fans from specified countries/cities</option>
       <option value="all" ${sendForm.type === "all" ? "selected" : ""}>All fans</option>
     </select></label>
-    ${sendForm.type === "places" ? `<label>Cities or countries<select name="placeKind">
+    ${sendForm.type === "places" ? `<p class="hint">A city includes people who registered at your event there, and people who registered with you anywhere and live there. Each person gets one code. If they match two cities, it is listed as their hometown.</p><label>Cities or countries<select name="placeKind">
       <option value="city" ${sendForm.placeKind === "city" ? "selected" : ""}>Cities</option>
       <option value="country" ${sendForm.placeKind === "country" ? "selected" : ""}>Countries</option>
     </select></label>` : ""}
@@ -270,7 +384,8 @@ function sendView() {
       <label class="choice"><input name="format" type="radio" value="text" ${sendForm.inPerson ? "" : "checked"}> Text</label>
       <label class="choice"><input name="format" type="radio" value="qr" ${sendForm.inPerson ? "checked" : ""}> QR code</label>
     </fieldset>
-    <label>Tile picture<input name="image" type="file" accept="image/png,image/jpeg,image/webp" required></label>
+    <label>Tile picture<input name="image" type="file" accept="image/png,image/jpeg,image/webp" ${heldFiles.image ? "" : "required"}></label>
+    ${heldFiles.image ? `<p class="hint">Picture added.</p>` : ""}
     <label>Expiry<input name="expires" type="date" value="${esc(sendForm.expires)}" required></label>
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
     <button class="primary" type="submit">Send codes</button>
@@ -279,9 +394,10 @@ function sendView() {
 
 function issuedView() {
   return `<section class="stack">
-    ${issued.length ? `<ul class="issued">${issued.map((item) => `<li>
+    ${error ? `<p class="error">${esc(error)}</p>` : ""}
+    ${issued.length ? `<p class="hint">Downloads are SHA-256 hashes of the codes, for the ticket seller. Fans still see the real code in the app.</p><ul class="issued">${issued.map((item) => `<li>
       ${item.image ? `<img alt="" src="${esc(item.image)}">` : ""}
-      <div><strong>${esc(item.label)}</strong><p>${esc(item.message)}</p><p class="hint">${item.count} people · ${item.inPerson ? "QR code" : "Text"} · ${item.expiresAt ? `Expires ${esc(when(item.expiresAt))}` : "No expiry"}</p></div>
+      <div><strong>${esc(item.label)}</strong><p>${esc(item.message)}</p><p class="hint">${item.count} people${item.groups?.length ? ` · ${esc(item.groups.join(" · "))}` : ""} · ${item.inPerson ? "QR code" : "Text"} · ${item.expiresAt ? `Expires ${esc(when(item.expiresAt))}` : "No expiry"}</p>${item.filename ? `<button class="ghost" type="button" data-csv="${esc(item.id)}" data-filename="${esc(item.filename)}">${esc(item.filename)}</button>` : ""}</div>
     </li>`).join("")}</ul>` : `<p class="hint">Codes you send will be listed here.</p>`}
   </section>`;
 }
@@ -292,6 +408,8 @@ function profileView() {
     <label>Name<input name="name" value="${esc(me?.name)}" required></label>
     <label>You are a<select name="kind">${kinds.map(([value, label]) => `<option value="${value}" ${me?.kind === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
     <label>Profile picture<input name="picture" type="file" accept="image/png,image/jpeg,image/webp"></label>
+    <label>Password<input name="currentPassword" type="password" autocomplete="current-password" required></label>
+    ${heldFiles.picture ? `<p class="hint">Picture added.</p>` : ""}
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
     ${notice ? `<p class="hint">${esc(notice)}</p>` : ""}
     <button class="primary" type="submit">Save profile</button>
@@ -312,10 +430,6 @@ function bindAuth() {
       await load();
     } catch (cause) {
       error = cause.message;
-      if (cause.message.includes("Confirm your email")) {
-        pendingEmail = String(form.get("email") || "");
-        sessionStorage.setItem("ticketid.org.pending", pendingEmail);
-      }
       render();
     }
   });
@@ -323,12 +437,25 @@ function bindAuth() {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const body = Object.fromEntries(form.entries());
-    try {
-      await api("/api/org/signup", { method: "POST", body });
-      pendingEmail = body.email;
-      sessionStorage.setItem("ticketid.org.pending", pendingEmail);
-      error = "";
+    if (body.password !== body.confirm) {
+      error = "Enter the same password twice.";
       render();
+      return;
+    }
+    const problem = passwordProblem(body.password);
+    if (problem) {
+      error = problem;
+      render();
+      return;
+    }
+    try {
+      const result = await api("/api/org/signup", { method: "POST", body });
+      token = result.token;
+      localStorage.setItem(tokenKey, token);
+      pendingEmail = "";
+      sessionStorage.removeItem("ticketid.org.pending");
+      error = "";
+      await load();
     } catch (cause) {
       error = cause.message;
       render();
@@ -350,6 +477,7 @@ function bindAuth() {
     }
   });
   document.querySelector("#resend")?.addEventListener("click", () => api("/api/resend", { method: "POST", body: { actor: "org", email: pendingEmail } }).catch((cause) => { error = cause.message; render(); }));
+  watchPassword(document.querySelector("#signup"));
 }
 
 function readDraft(form) {
@@ -379,7 +507,11 @@ function bindApp() {
     scanner = null;
     if (page === "events") hideCompleted = true;
     if (page === "issued") issued = await api("/api/codes", { token }).catch(() => []);
+    if (page === "send") audiencePlaces = await api("/api/places", { token }).catch(() => ({ cities: [], countries: [] }));
     if (page === "create") draft = blankDraft();
+    holdGeneration += 1;
+    heldFiles.image = "";
+    heldFiles.picture = "";
     render();
   }));
   document.querySelector("#new-code")?.addEventListener("click", async () => {
@@ -422,7 +554,7 @@ function bindApp() {
     const form = new FormData(event.currentTarget);
     readDraft(event.currentTarget);
     try {
-      const image = await fileData(form.get("image"));
+      const image = await chosenImage("image", form.get("image"));
       const tourName = draft.tourPick === "__new" ? draft.tourName : draft.tourPick;
       gig = await api("/api/gigs", {
         method: "POST",
@@ -440,7 +572,9 @@ function bindApp() {
         },
       });
       gigs = await api("/api/gigs", { token });
+      scanners = gig.owner ? await api(`/api/gigs/${gig.id}/receivers`, { token }) : [];
       page = "event";
+      heldFiles.image = "";
       error = "";
       notice = "Event created.";
       render();
@@ -457,6 +591,7 @@ function bindApp() {
     try {
       gig = await api(`/api/gigs/${button.dataset.gig}`, { token });
       scanner = null;
+      scanners = gig.owner ? await api(`/api/gigs/${gig.id}/receivers`, { token }) : [];
       page = "event";
       error = "";
       notice = "";
@@ -479,6 +614,19 @@ function bindApp() {
       error = cause.message;
       render();
     }
+  });
+  document.querySelectorAll("[data-receiver]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api(`/api/gigs/${gig.id}/receivers/${button.dataset.receiver}`, { method: "DELETE", token });
+        scanners = await api(`/api/gigs/${gig.id}/receivers`, { token });
+        notice = "Scanner disconnected.";
+        error = "";
+      } catch (cause) {
+        error = cause.message;
+      }
+      render();
+    });
   });
   document.querySelector("#scanner-code")?.addEventListener("click", async () => {
     try {
@@ -511,6 +659,7 @@ function bindApp() {
     try {
       gig = await api(`/api/gigs/${gig.id}/live`, { method: "POST", token, body: {} });
       gigs = await api("/api/gigs", { token });
+      scanners = [];
       notice = "This event is live.";
       error = "";
       render();
@@ -519,10 +668,11 @@ function bindApp() {
       render();
     }
   });
-  document.querySelector("#new-send")?.addEventListener("click", () => {
+  document.querySelector("#new-send")?.addEventListener("click", async () => {
     sendForm = { ...blankSend(), open: true };
     error = "";
     notice = "";
+    audiencePlaces = await api("/api/places", { token }).catch(() => ({ cities: [], countries: [] }));
     render();
   });
   document.querySelector("#send-form")?.addEventListener("change", (event) => {
@@ -592,7 +742,7 @@ function bindApp() {
       return;
     }
     try {
-      const image = await fileData(form.get("image"));
+      const image = await chosenImage("image", form.get("image"));
       const result = await api("/api/codes", {
         method: "POST",
         token,
@@ -602,10 +752,11 @@ function bindApp() {
           inPerson: form.get("format") === "qr",
           expiresAt: form.get("expires"),
           image,
-          groups: sendForm.groups.map(({ type, gigIds, tours, names }) => ({ type, gigIds, tours, names })),
+          groups: sendForm.groups.map(({ type, gigIds, tours, names, label: groupLabel }) => ({ type, gigIds, tours, names, label: groupLabel })),
         },
       });
       sendForm = blankSend();
+      heldFiles.image = "";
       notice = `Sent to ${result.count} people.`;
       error = "";
       issued = await api("/api/codes", { token });
@@ -620,8 +771,9 @@ function bindApp() {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
-      const picture = await fileData(form.get("picture"));
-      me = await api("/api/org/me", { method: "PATCH", token, body: { name: form.get("name"), kind: form.get("kind"), ...(picture ? { profileImage: picture } : {}) } });
+      const picture = await chosenImage("picture", form.get("picture"));
+      me = await api("/api/org/me", { method: "PATCH", token, body: { name: form.get("name"), kind: form.get("kind"), currentPassword: form.get("currentPassword"), ...(picture ? { profileImage: picture } : {}) } });
+      heldFiles.picture = "";
       notice = "Profile saved.";
       error = "";
       render();
@@ -630,6 +782,36 @@ function bindApp() {
       render();
     }
   });
+  document.querySelectorAll("input[type=file]").forEach((input) => {
+    input.addEventListener("change", () => { holdFile(input); });
+  });
+  document.querySelectorAll("[data-csv]").forEach((button) => {
+    button.addEventListener("click", () => downloadRelease(button.dataset.csv, button.dataset.filename));
+  });
+}
+
+async function downloadRelease(batchId, filename) {
+  try {
+    const response = await fetch(resolve(`/api/codes/${batchId}`), {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.message || "That file could not be downloaded.");
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename || "codes.csv";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (cause) {
+    error = cause.message;
+    render();
+  }
 }
 
 async function load() {
@@ -639,5 +821,11 @@ async function load() {
   render();
 }
 
-if (token) load().catch(() => { localStorage.removeItem(tokenKey); token = null; render(); });
+if (token) load().catch((cause) => {
+  if (cause?.status === 401) {
+    localStorage.removeItem(tokenKey);
+    token = null;
+  }
+  render();
+});
 else render();

@@ -1,8 +1,25 @@
 body[data-app="dashboard"] { background: var(--bg); }
 
-.desk { max-width: 920px; margin: 0 auto; padding: 1.5rem; }
+.desk {
+  max-width: 920px;
+  margin: 0 auto;
+  padding:
+    calc(var(--safe-top, env(safe-area-inset-top, 0px)) + 1.5rem)
+    1.5rem
+    calc(var(--safe-bottom, env(safe-area-inset-bottom, 0px)) + 1.5rem);
+}
 
 .top { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+
+.lockup { display: flex; flex-direction: column; gap: 0.05rem; }
+
+.lockup .role {
+  margin: 0;
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 650;
+  letter-spacing: -0.03em;
+}
 
 .gig-list { display: flex; flex-direction: column; gap: 0.6rem; padding: 0; list-style: none; }
 
@@ -59,7 +76,7 @@ h2 { margin: 0.4rem 0 0; font-size: 1.05rem; }
 
 .cover { width: min(100%, 280px); aspect-ratio: 1; object-fit: cover; border-radius: 16px; }
 
-.door-qr { width: 180px; height: 180px; background: var(--paper); border-radius: 12px; }
+.door-qr { width: min(100%, 280px); height: auto; background: #fff; border-radius: 0; }
 
 .picker, .choice-set { display: flex; flex-direction: column; gap: 0.45rem; border: 0; margin: 0; padding: 0; }
 

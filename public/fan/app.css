@@ -2,6 +2,7 @@ body[data-app="fan"] {
   display: grid;
   place-items: center;
   min-height: 100dvh;
+  background: var(--bg);
 }
 
 .phone {
@@ -11,6 +12,12 @@ body[data-app="fan"] {
   background: var(--bg);
   position: relative;
   overflow: hidden;
+  padding-bottom: max(var(--safe-bottom, 0px), env(safe-area-inset-bottom, 0px));
+}
+
+@media (max-width: 520px) {
+  body[data-app="fan"] { display: block; }
+  .phone { width: 100%; max-height: none; }
 }
 
 .auth {
@@ -20,7 +27,7 @@ body[data-app="fan"] {
   padding: 0;
 }
 
-.auth > .brand { padding: 1.1rem 1.5rem 0; }
+.auth > .brand { padding: calc(max(var(--safe-top, 0px), env(safe-area-inset-top, 0px), 1.6rem) + 0.55rem) 1.5rem 0; }
 
 .auth > form, .auth > .stack { padding: 1.25rem 1.5rem 1.5rem; }
 
@@ -34,13 +41,25 @@ body[data-app="fan"] {
 
 .topbar { flex: none; position: relative; z-index: 5; }
 
+.offline {
+  flex: none;
+  margin: 0;
+  padding: 0.45rem 1rem;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 0.85rem;
+}
+
 .viewport.menu-open .topbar { z-index: auto; }
 
 .viewport.menu-open .menu { z-index: 6; }
 
-.topbar.brand { justify-content: flex-start; }
+.topbar.brand {
+  justify-content: flex-start;
+  padding-top: calc(max(var(--safe-top, 0px), env(safe-area-inset-top, 0px), 1.6rem) + 0.55rem);
+}
 
-.topbar .wordmark { font-size: 1.45rem; }
+.topbar .wordmark { font-size: 1.95rem; }
 
 .tabs {
   display: flex;
@@ -72,21 +91,23 @@ body[data-app="fan"] {
 
 .pager {
   display: flex;
-  width: 100%;
+  width: 300%;
   height: 100%;
-  transition: transform 0.28s ease;
   touch-action: pan-y;
 }
 
 .page {
-  flex: 0 0 100%;
-  width: 100%;
-  min-width: 100%;
+  flex: none;
+  width: 33.333333%;
+  min-width: 33.333333%;
   height: 100%;
   position: relative;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-x: none;
   display: flex;
   flex-direction: column;
+  touch-action: pan-y;
 }
 
 .brand {
@@ -94,7 +115,7 @@ body[data-app="fan"] {
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
-  padding: 0.95rem 0.7rem 0.15rem 1.1rem;
+  padding: calc(max(var(--safe-top, 0px), env(safe-area-inset-top, 0px), 1.6rem) + 0.55rem) 0.7rem 0.15rem 1.1rem;
   flex: none;
 }
 
@@ -190,6 +211,12 @@ body[data-app="fan"] {
 .qr-card img { display: block; width: min(68vw, 260px); height: auto; }
 
 .qr-card p { margin: 0.4rem 0 0; color: var(--ink); letter-spacing: 0.12em; font-size: 0.85rem; }
+
+.qr-card p.qr-left {
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+  font-size: 1.05rem;
+}
 
 .tiles {
   display: grid;

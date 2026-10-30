@@ -1,3 +1,6 @@
+import { api } from "/net.js";
+
+window.TICKETID_ACTOR = "receiver";
 const tokenKey = "ticketid.receiver";
 const pinKey = "ticketid.scanner.pin";
 const lockKey = "ticketid.scanner.locked";
@@ -42,21 +45,38 @@ function cameraIcon() {
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.2 8.4h1.1l.7-1.2h3.2l.7 1.2h1.9a1.3 1.3 0 0 1 1.3 1.3v4.6a1.3 1.3 0 0 1-1.3 1.3H8.2a1.3 1.3 0 0 1-1.3-1.3V9.7a1.3 1.3 0 0 1 1.3-1.3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="12" cy="11.2" r="1.7" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M16.7 16.4a6.3 6.3 0 0 1-9.6-.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M6.4 14.2 7.2 16.8 9.7 15.7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M7.3 7.6a6.3 6.3 0 0 1 9.6.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M17.6 9.8 16.8 7.2 14.3 8.3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }
 
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    method: options.method || "GET",
-    headers: {
-      ...(options.body ? { "content-type": "application/json" } : {}),
-      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.message || "Something went wrong.");
-  return data;
+let sessionWatch = 0;
+
+function signedOut() {
+  stopCamera();
+  localStorage.removeItem(tokenKey);
+  localStorage.removeItem(lockKey);
+  token = null;
+  locked = false;
+  image = "";
+  eventName = "";
+  mode = "scan";
+  busy = false;
+  error = "This phone was signed out.";
+  render();
+}
+
+function watchSession(active) {
+  clearInterval(sessionWatch);
+  sessionWatch = 0;
+  if (!active) return;
+  sessionWatch = setInterval(async () => {
+    if (!token) return;
+    try {
+      await api("/api/receiver/event", { token });
+    } catch (cause) {
+      if (cause.status === 401) signedOut();
+    }
+  }, 4000);
 }
 
 function render() {
+  watchSession(Boolean(token));
   if (!token) {
     stopCamera();
     locked = false;
@@ -65,7 +85,7 @@ function render() {
       app.innerHTML = `<section class="poster">
         <button class="leave" type="button" aria-label="Back">×</button>
         <header class="mast">
-          <p class="powered">Powered by ticket<span>ID</span></p>
+          <p class="powered">ticket<span>ID</span><span class="role">Receiver</span></p>
           <h1 class="event-name">Scan code</h1>
         </header>
         <div class="finder-wrap"><div class="finder"><video autoplay playsinline muted disablepictureinpicture></video></div></div>
@@ -81,7 +101,7 @@ function render() {
     }
     stopJoin();
     app.innerHTML = `<main class="screen"><form class="stack" id="join">
-      <p class="wordmark">ticket<span>ID</span></p>
+      <div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Receiver</p></div>
       <h1>Join an event</h1>
       <label>Scanner code<input name="code" autocapitalize="characters" required></label>
       ${error ? `<p class="error">${esc(error)}</p>` : ""}
@@ -119,7 +139,7 @@ function render() {
     stopCamera();
     app.innerHTML = `<section class="poster is-success${locked ? " is-locked" : ""}" style="background-image:url('${esc(image)}')">
       ${chrome()}
-      <p class="success-line">Successfully registered at ${esc(eventName)}</p>
+      <div class="success-pop" role="status"><p>Successfully registered at ${esc(eventName)}</p></div>
     </section>`;
     bindChrome();
     return;
@@ -127,10 +147,10 @@ function render() {
   app.innerHTML = `<section class="poster${locked ? " is-locked" : ""}" style="background-image:url('${esc(image)}')">
     ${chrome()}
     <header class="mast">
-      <p class="powered">Powered by ticket<span>ID</span></p>
-      <h1 class="event-name">${esc(eventName)}</h1>
+      <p class="powered">ticket<span>ID</span><span class="role">Receiver</span></p>
     </header>
     <div class="finder-wrap">
+      <h1 class="event-name">${esc(eventName)}</h1>
       <div class="finder">
         <video autoplay playsinline muted disablepictureinpicture></video>
         <div class="store-reveal">${storeQrHtml()}</div>
@@ -191,7 +211,6 @@ function bindChrome() {
 }
 
 async function openStore(which) {
-  if (locked) return;
   const reveal = document.querySelector(".store-reveal");
   if (!reveal) return;
   if (store === which) {
@@ -389,7 +408,13 @@ async function watchJoin() {
     await video.play().catch(() => undefined);
     scanFrames(video, () => mine === joinAttempt && !token && joining, async (raw) => {
       if (!/^ticketid:[A-Za-z0-9]+$/i.test(raw)) return false;
-      await acceptJoin(raw);
+      try {
+        await acceptJoin(raw);
+      } catch (cause) {
+        error = cause.message;
+        joining = false;
+        render();
+      }
       return true;
     });
   } catch {
@@ -442,6 +467,10 @@ async function redeem(raw) {
     }, 4000);
     return true;
   } catch (cause) {
+    if (cause.status === 401) {
+      signedOut();
+      return false;
+    }
     busy = false;
     heldCode = code;
     heldUntil = Date.now() + 3000;
