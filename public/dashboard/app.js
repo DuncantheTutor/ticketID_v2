@@ -4,11 +4,12 @@ import { gigDay, isWallClock, wallHasPassed } from "/when.js";
 window.TICKETID_ACTOR = "org";
 const tokenKey = "ticketid.org";
 const app = document.querySelector("#app");
+const everyoneLabel = "Everyone who has registered with you";
 let token = localStorage.getItem(tokenKey);
 let me = null;
 let gigs = [];
 let issued = [];
-let page = "home";
+let page = "event";
 let view = "login";
 let gig = null;
 let joinCode = "";
@@ -19,12 +20,16 @@ let scanners = [];
 let error = "";
 let notice = "";
 let pendingEmail = sessionStorage.getItem("ticketid.org.pending") || "";
-let hideCompleted = true;
+let showPast = false;
+let confirmAction = "";
 let draft = blankDraft();
 let sendForm = blankSend();
+let profileDraft = null;
 let audiencePlaces = { cities: [], countries: [] };
 const heldFiles = { image: "", picture: "" };
 let holdGeneration = 0;
+let routeGeneration = 0;
+let countGeneration = 0;
 
 const kinds = [
   ["band", "Band"],
@@ -36,11 +41,26 @@ const kinds = [
 ];
 
 function blankDraft() {
-  return { name: "", date: "", time: "", bio: "", city: "", country: "", tourPick: "__new", tourName: "", copyFrom: "", copyLabel: "" };
+  return { name: "", date: "", time: "", bio: "", city: "", country: "", tourPick: "", tourName: "", copyFrom: "", copyLabel: "" };
 }
 
 function blankSend() {
-  return { label: "", message: "", inPerson: false, expires: "", groups: [], type: "events", gigIds: [], tours: [], placeKind: "city", names: [], open: false, menuOpen: false };
+  return {
+    step: 1,
+    label: "",
+    message: "",
+    inPerson: false,
+    expires: "",
+    type: "events",
+    gigIds: [],
+    tours: [],
+    placeKind: "city",
+    names: [],
+    extra: [],
+    menuOpen: false,
+    count: null,
+    counting: false,
+  };
 }
 
 function esc(value) {
@@ -129,8 +149,8 @@ async function readImage(file) {
       const buffer = await blob.arrayBuffer();
       if (!buffer.byteLength) throw new Error("That image could not be read.");
       return await shrinkImage(new Blob([buffer], { type: file.type || "image/jpeg" }));
-    } catch (error) {
-      last = error instanceof Error ? error : last;
+    } catch (cause) {
+      last = cause instanceof Error ? cause : last;
       await pause(70 * 2 ** attempt);
     }
   }
@@ -189,7 +209,7 @@ function when(iso) {
 
 function eventChoiceLabel(item) {
   const name = item.name || "Untitled event";
-  const shared = gigs.filter((gig) => (gig.name || "Untitled event") === name).length > 1;
+  const shared = gigs.filter((gigItem) => (gigItem.name || "Untitled event") === name).length > 1;
   return shared ? `${name}, ${when(item.startsAt)}` : name;
 }
 
@@ -201,10 +221,172 @@ function canDelete(item) {
   return !item?.startsAt || !item.live;
 }
 
+function peopleLabel(count) {
+  const total = Number(count) || 0;
+  return total === 1 ? "1 person" : `${total} people`;
+}
+
+function registeredLabel(count) {
+  const total = Number(count) || 0;
+  return total === 1 ? "1 person registered" : `${total} people registered`;
+}
+
+function scannerLabel(count) {
+  const total = Number(count) || 0;
+  return total === 1 ? "1 scanner signed in" : `${total} scanners signed in`;
+}
+
 function roleTitle(role) {
   if (role === "act") return "Bands";
   if (role === "venue") return "Venue";
   return role === "festival" ? "Festival" : "Organiser";
+}
+
+function upcomingId() {
+  const next = gigs
+    .filter((item) => item.startsAt && !completed(item))
+    .sort((left, right) => String(left.startsAt).localeCompare(String(right.startsAt)))[0];
+  return next?.id || "";
+}
+
+function readRoute() {
+  const raw = location.hash.replace(/^#\/?/, "");
+  const [name, id] = raw.split("/");
+  if (name === "event") return { page: "event", id: id || "" };
+  if (["events", "create", "send", "issued", "profile"].includes(name)) return { page: name, id: "" };
+  return { page: "event", id: "" };
+}
+
+function writeRoute() {
+  const next = page === "event" ? (gig?.id ? `#/event/${gig.id}` : "#/event") : `#/${page}`;
+  const url = `${location.pathname}${location.search}${next}`;
+  if (`${location.pathname}${location.search}${location.hash}` !== url) history.replaceState(null, "", url);
+}
+
+function resetPageDraft(next) {
+  holdGeneration += 1;
+  if (next === "create") {
+    draft = blankDraft();
+    heldFiles.image = "";
+  }
+  if (next === "send") {
+    sendForm = blankSend();
+    heldFiles.image = "";
+  }
+  if (next === "profile") {
+    heldFiles.picture = "";
+    profileDraft = null;
+  }
+}
+
+function startJoinClock() {
+  clearInterval(joinTimer);
+  joinTimer = setInterval(() => {
+    const seconds = Math.max(0, Math.ceil((joinExpires - Date.now()) / 1000));
+    if (seconds <= 0) {
+      joinCode = "";
+      clearInterval(joinTimer);
+      if (page === "profile") render();
+      return;
+    }
+    const node = document.querySelector("#join-left");
+    if (node) node.textContent = `${seconds}s`;
+  }, 1000);
+}
+
+function joinSeconds() {
+  if (!joinCode) return 0;
+  const seconds = Math.max(0, Math.ceil((joinExpires - Date.now()) / 1000));
+  if (!seconds) joinCode = "";
+  return seconds;
+}
+
+function currentAudience() {
+  if (sendForm.type === "all") return { type: "all", label: everyoneLabel };
+  if (sendForm.type === "events" && sendForm.gigIds.length) {
+    const names = gigs.filter((item) => sendForm.gigIds.includes(item.id)).map((item) => eventChoiceLabel(item));
+    return { type: "events", gigIds: [...sendForm.gigIds], label: `Events: ${names.join(" · ")}` };
+  }
+  if (sendForm.type === "tours" && sendForm.tours.length) {
+    return { type: "tours", tours: [...sendForm.tours], label: `Tours: ${sendForm.tours.join(", ")}` };
+  }
+  if (sendForm.type === "places" && sendForm.names.length) {
+    const kind = sendForm.placeKind === "country" ? "Countries" : "Cities";
+    return { type: "places", names: [...sendForm.names], label: `${kind}: ${sendForm.names.join(", ")}` };
+  }
+  return null;
+}
+
+function audienceGroups() {
+  const current = currentAudience();
+  return current ? [...sendForm.extra, current] : [...sendForm.extra];
+}
+
+function payloadGroups() {
+  return audienceGroups().map(({ type, gigIds, tours, names, label }) => ({ type, gigIds, tours, names, label }));
+}
+
+function countState() {
+  if (!audienceGroups().length) return { text: "Choose who should receive this code.", ready: false };
+  if (sendForm.counting || sendForm.count === null) return { text: "Counting…", ready: false };
+  if (!sendForm.count) return { text: "Nobody in that group can receive a code yet.", ready: false };
+  return { text: peopleLabel(sendForm.count), ready: true };
+}
+
+function paintCount() {
+  const state = countState();
+  const node = document.querySelector("#who-count");
+  if (node) {
+    node.textContent = state.text;
+    node.className = state.ready ? "tally" : "hint";
+  }
+  const button = document.querySelector("#continue-send");
+  if (button) button.disabled = !state.ready;
+  const add = document.querySelector("#add-audience");
+  if (add) add.hidden = !currentAudience();
+}
+
+async function refreshCount() {
+  const groups = payloadGroups();
+  const generation = ++countGeneration;
+  if (!groups.length) {
+    sendForm.count = null;
+    sendForm.counting = false;
+    paintCount();
+    return;
+  }
+  sendForm.count = null;
+  sendForm.counting = true;
+  paintCount();
+  try {
+    const result = await api("/api/codes/preview", { method: "POST", token, body: { groups } });
+    if (generation !== countGeneration) return;
+    sendForm.count = result.count;
+    sendForm.counting = false;
+    error = "";
+    paintCount();
+  } catch (cause) {
+    if (generation !== countGeneration) return;
+    sendForm.count = null;
+    sendForm.counting = false;
+    error = cause.message;
+    render();
+  }
+}
+
+function draftPreview() {
+  if (heldFiles.image) return heldFiles.image;
+  if (!draft.copyFrom) return "";
+  return gigs.find((item) => item.id === draft.copyFrom)?.image || "";
+}
+
+function pageTitle() {
+  if (page === "event") return gig ? (gig.name || "Untitled event") : "Event";
+  if (page === "events") return "Events";
+  if (page === "create") return "Create event";
+  if (page === "send") return "Send codes";
+  if (page === "issued") return "Issued codes";
+  return "Profile";
 }
 
 function render() {
@@ -218,29 +400,56 @@ function render() {
     : page === "event" ? eventView()
     : page === "send" ? sendView()
     : page === "issued" ? issuedView()
-    : page === "profile" ? profileView()
-    : homeView();
-  app.innerHTML = `<header class="top"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><button class="ghost" id="signout" type="button">Sign out</button></header>${nav()}${body}`;
+    : profileView();
+  app.innerHTML = frame(pageTitle(), body);
   bindApp();
+  if (page === "send" && sendForm.step === 1) paintCount();
+}
+
+function frame(title, body) {
+  return `<div class="shell">
+    <header class="phone-bar">
+      <p class="wordmark">ticket<span>ID</span></p>
+      <button class="ghost" type="button" data-signout>Sign out</button>
+    </header>
+    <aside class="side">
+      <div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div>
+      ${nav()}
+      <button class="ghost" type="button" data-signout>Sign out</button>
+    </aside>
+    <main class="work stack">
+      <h1>${esc(title)}</h1>
+      ${error ? `<p class="error">${esc(error)}</p>` : ""}
+      ${notice ? `<p class="hint">${esc(notice)}</p>` : ""}
+      ${body}
+    </main>
+    ${phoneNav()}
+  </div>`;
 }
 
 function nav() {
-  const items = [["home", "Home"], ["create", "Create event"], ["events", "Events"], ["send", "Send codes"], ["issued", "Issued codes"], ["profile", "Profile"]];
+  const items = [["event", "Event"], ["events", "Events"], ["create", "Create event"], ["send", "Send codes"], ["issued", "Issued codes"], ["profile", "Profile"]];
   return `<nav class="nav">${items.map(([id, label]) => `<button type="button" data-page="${id}" ${page === id ? "aria-current=\"page\"" : ""}>${label}</button>`).join("")}</nav>`;
 }
 
+function phoneNav() {
+  const items = [["event", "Event"], ["events", "Events"], ["create", "Create"], ["send", "Send"], ["issued", "Issued"], ["profile", "Profile"]];
+  return `<nav class="phone-nav">${items.map(([id, label]) => `<button type="button" data-page="${id}" ${page === id ? "aria-current=\"page\"" : ""}>${label}</button>`).join("")}</nav>`;
+}
+
 function loginView() {
-  return `<main class="stack"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><form class="stack" id="login">
-    <label>Email<input name="email" type="email" required></label>
-    <label>Password<input name="password" type="password" required></label>
+  return `<main class="auth-wrap stack"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><form class="stack" id="login">
+    <label>Email<input name="email" type="email" autocomplete="username" required></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
+    ${notice ? `<p class="hint">${esc(notice)}</p>` : ""}
     <button class="primary" type="submit">Log in</button>
     <button class="ghost" id="to-signup" type="button">Create an account</button>
   </form></main>`;
 }
 
 function signupView() {
-  return `<main class="stack"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><form class="stack" id="signup">
+  return `<main class="auth-wrap stack"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><form class="stack" id="signup">
     <label>Account<select name="kind">${kinds.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select></label>
     <label>Name<input name="name" required></label>
     <label>Email<input name="email" type="email" required></label>
@@ -254,120 +463,144 @@ function signupView() {
 }
 
 function verifyView() {
-  return `<main class="stack"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><form class="stack" id="verify">
-    <p>We sent a message to ${esc(pendingEmail)}. Open the link, or enter the code.</p>
-    <label>Code<input name="code" required></label>
+  return `<main class="auth-wrap stack"><div class="lockup"><p class="wordmark">ticket<span>ID</span></p><p class="role">Dashboard</p></div><form class="stack" id="verify">
+    <p>We sent a message to ${esc(pendingEmail)}. Open the link, or enter the code. The account stays closed until that is done.</p>
+    <label>Code<input name="code" inputmode="numeric" autocomplete="one-time-code" required></label>
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
     <button class="primary" type="submit">Confirm email</button>
     <button class="ghost" id="resend" type="button">Send the email again</button>
+    <button class="ghost" id="to-login" type="button">Back to log in</button>
   </form></main>`;
-}
-
-function homeView() {
-  const seconds = joinCode ? Math.max(0, Math.ceil((joinExpires - Date.now()) / 1000)) : 0;
-  if (!seconds) joinCode = "";
-  return `<section class="stack">
-    <button class="primary" id="new-code" type="button">Generate event code</button>
-    ${joinCode ? `<p class="join-code">${esc(joinCode)}</p><p class="hint">${seconds}s</p>` : ""}
-    ${error ? `<p class="error">${esc(error)}</p>` : ""}
-  </section>`;
 }
 
 function createView() {
   const previous = gigs.filter((item) => item.name);
-  return `<section class="stack">
-    <form class="stack" id="create-event">
-      <label>Copy previous event<select name="copyFrom">
-        <option value="">Start a blank event</option>
-        ${previous.map((item) => `<option value="${esc(item.id)}" ${draft.copyFrom === item.id ? "selected" : ""}>${esc(item.name)}</option>`).join("")}
-      </select></label>
-      ${draft.copyLabel ? `<p class="hint">Using the picture from ${esc(draft.copyLabel)} unless you choose a new one. Date and start time are left blank.</p>` : ""}
-      <label>Name<input name="name" value="${esc(draft.name)}" required></label>
-      <div class="row">
-        <label>Date<input name="date" type="date" value="${esc(draft.date)}"></label>
-        <label>Time<input name="time" type="time" value="${esc(draft.time)}"></label>
-      </div>
-      <label>Bio<textarea name="bio">${esc(draft.bio)}</textarea></label>
-      <label>Picture<input name="image" type="file" accept="image/png,image/jpeg,image/webp" ${draft.copyFrom || heldFiles.image ? "" : "required"}></label>
-      ${heldFiles.image ? `<p class="hint">Picture added.</p>` : ""}
-      <div class="row">
-        <label>City<input name="city" value="${esc(draft.city)}"></label>
-        <label>Country<input name="country" value="${esc(draft.country)}"></label>
-      </div>
-      <label>Tour or series<select name="tourPick">
-        <option value="__new" ${draft.tourPick === "__new" ? "selected" : ""}>Create new</option>
-        ${tours().map((name) => `<option value="${esc(name)}" ${draft.tourPick === name ? "selected" : ""}>${esc(name)}</option>`).join("")}
-      </select></label>
-      ${draft.tourPick === "__new" ? `<label>New tour or series<input name="tourName" value="${esc(draft.tourName)}"></label>` : ""}
-      ${error ? `<p class="error">${esc(error)}</p>` : ""}
-      <button class="primary" type="submit">Create event</button>
-    </form></section>`;
+  const preview = draftPreview();
+  return `<form class="stack" id="create-event">
+    <label>Copy previous event<select name="copyFrom">
+      <option value="">Start a blank event</option>
+      ${previous.map((item) => `<option value="${esc(item.id)}" ${draft.copyFrom === item.id ? "selected" : ""}>${esc(item.name)}</option>`).join("")}
+    </select></label>
+    ${draft.copyLabel ? `<p class="hint">Using the picture from ${esc(draft.copyLabel)} unless you choose a new one. Date and start time are left blank.</p>` : ""}
+    <label>Name<input name="name" value="${esc(draft.name)}" required></label>
+    <div class="split">
+      <label>Date<input name="date" type="date" value="${esc(draft.date)}" required></label>
+      <label>Time<input name="time" type="time" value="${esc(draft.time)}" required></label>
+    </div>
+    <label>Bio<textarea name="bio">${esc(draft.bio)}</textarea></label>
+    <label>Picture<input name="image" type="file" accept="image/png,image/jpeg,image/webp" ${draft.copyFrom || heldFiles.image ? "" : "required"}></label>
+    <p class="hint">Fans see this when they register, and the scanner shows it on the night.</p>
+    ${preview ? `<img class="cover" alt="" src="${esc(preview)}">` : ""}
+    <div class="split">
+      <label>City<input name="city" value="${esc(draft.city)}"></label>
+      <label>Country<input name="country" value="${esc(draft.country)}"></label>
+    </div>
+    <p class="hint">City and country are how a later code finds people in that place.</p>
+    <label>Tour or series<select name="tourPick">
+      <option value="" ${draft.tourPick === "" ? "selected" : ""}>No tour</option>
+      <option value="__new" ${draft.tourPick === "__new" ? "selected" : ""}>Create new</option>
+      ${tours().map((name) => `<option value="${esc(name)}" ${draft.tourPick === name ? "selected" : ""}>${esc(name)}</option>`).join("")}
+    </select></label>
+    ${draft.tourPick === "__new" ? `<label>New tour or series<input name="tourName" value="${esc(draft.tourName)}"></label>` : ""}
+    <button class="primary" type="submit">Create event</button>
+  </form>`;
 }
 
 function eventsView() {
-  const shown = gigs.filter((item) => !hideCompleted || !completed(item));
-  return `<section class="stack">
-    <label class="choice"><input id="hide-completed" type="checkbox" ${hideCompleted ? "checked" : ""}> Do not show completed events</label>
+  const shown = gigs.filter((item) => showPast || !completed(item)).sort(compareEvents);
+  return `<label class="choice"><input id="show-past" type="checkbox" ${showPast ? "checked" : ""}> Show past events</label>
     <div class="event-grid">${shown.map((item) => `<button class="event-tile" type="button" data-gig="${esc(item.id)}">
       ${item.image ? `<img alt="" src="${esc(item.image)}">` : `<span class="event-fallback"></span>`}
       <strong>${esc(item.name || "Untitled event")}</strong>
-      <small>${esc(when(item.startsAt))}${item.live ? "" : " · Not live"}</small>
-    </button>`).join("") || `<p class="hint">No events to show.</p>`}</div>
-  </section>`;
+      <small>${esc(when(item.startsAt))} · ${item.live ? "Live" : "Not live"}</small>
+      <small>${esc(registeredLabel(item.registered))}</small>
+    </button>`).join("") || `<p class="hint">No events to show.</p>`}</div>`;
+}
+
+function compareEvents(left, right) {
+  const leftDone = completed(left);
+  const rightDone = completed(right);
+  if (leftDone !== rightDone) return leftDone ? 1 : -1;
+  if (!left.startsAt && !right.startsAt) return 0;
+  if (!left.startsAt) return 1;
+  if (!right.startsAt) return -1;
+  const order = String(left.startsAt).localeCompare(String(right.startsAt));
+  return leftDone ? -order : order;
 }
 
 function eventView() {
-  if (!gig) return `<p class="hint">That event is not available.</p>`;
-  const groups = ["act", "venue", "festival", "organiser"].filter((role) => gig.members.some((member) => member.role === role));
-  return `<section class="stack"><h1>${esc(gig.name || "Untitled event")}</h1>
+  if (!gig) {
+    return `<p class="hint">No upcoming event. Past events are in the list.</p>
+      <button class="primary" id="go-create" type="button">Create event</button>`;
+  }
+  const place = [gig.city, gig.country].filter(Boolean).join(", ");
+  const parts = [gig.live ? "Live" : "Not live", registeredLabel(gig.registered)];
+  if (gig.owner) parts.push(scannerLabel(scanners.length));
+  return `<p class="status">${esc(parts.join(" · "))}</p>
     ${gig.image ? `<img class="cover" alt="" src="${esc(gig.image)}">` : ""}
-    <p>${esc(when(gig.startsAt))}${gig.city || gig.country ? ` · ${esc([gig.city, gig.country].filter(Boolean).join(", "))}` : ""}</p>
+    <p>${esc(when(gig.startsAt))}${place ? ` · ${esc(place)}` : ""}</p>
     ${gig.bio ? `<p>${esc(gig.bio)}</p>` : ""}
     ${gig.tourName ? `<p class="hint">${esc(gig.tourName)}</p>` : ""}
-    ${groups.map((role) => `<div><h2>${roleTitle(role)}</h2><p class="members">${gig.members.filter((member) => member.role === role).map((member) => esc(member.name)).join("<br>")}</p></div>`).join("")}
-    ${gig.owner ? `<form class="row" id="add-member">
-      <label>Add to event<input name="code" autocapitalize="characters" required></label>
-      <button class="primary" type="submit">Add</button>
-    </form>
-    ${gig.live ? `<div class="stack door">
-      <button class="primary" id="scanner-code" type="button">Generate scanner code</button>
-      ${scanner?.gigId === gig.id ? `<p class="join-code">${esc(scanner.code)}</p>
-        ${scanner.qr ? `<img class="door-qr" alt="Scanner code" src="${esc(scanner.qr)}">` : ""}
-        <p class="hint">This code works once, for one new phone. Phones that are already signed in stay signed in.</p>` : `<p class="hint">A scanner code is created when you ask for one. It is not kept on this page.</p>`}
-      <h2>Signed-in scanners</h2>
-      ${scanners.length ? scanners.map((item) => `<div class="row"><span>Signed in ${esc(signedInLabel(item.signedInAt))}</span><button class="ghost" type="button" data-receiver="${esc(item.id)}">Disconnect</button></div>`).join("") : `<p class="hint">No scanners are signed in.</p>`}
-      <p class="hint">A scanner stays signed in for 24 hours. Disconnect it here to end it sooner.</p>
-    </div>` : `<button class="primary" id="go-live" type="button">Go live</button>`}
-    ${canDelete(gig) ? `<button class="ghost" id="delete-event" type="button">Delete event</button>` : ""}` : ""}
-    ${error ? `<p class="error">${esc(error)}</p>` : ""}
-    ${notice ? `<p class="hint">${esc(notice)}</p>` : ""}
+    ${billBlock()}
+    ${gig.owner ? `<section class="panel"><h2>Check-in</h2>${checkinBlock()}</section>${deleteBlock()}` : `<section class="panel"><p>You can send a code to people who registered at this event.</p><button class="primary" id="send-to-event" type="button">Send a code</button></section>`}`;
+}
+
+function billBlock() {
+  const members = gig.members || [];
+  const roles = ["act", "venue", "festival", "organiser"].filter((role) => members.some((member) => member.role === role));
+  return `<section class="panel">
+    <h2>On the bill</h2>
+    ${roles.map((role) => `<div><h2>${roleTitle(role)}</h2><p class="members">${members.filter((member) => member.role === role).map((member) => esc(member.name)).join("<br>")}</p></div>`).join("")}
+    ${gig.owner ? `<form class="stack" id="add-member">
+      <label>Event code<input name="code" autocapitalize="characters" autocomplete="off" required></label>
+      <p class="hint">The event code from their Profile. It adds them to this bill.</p>
+      <button class="secondary" type="submit">Add</button>
+    </form>` : ""}
   </section>`;
 }
 
-function sendView() {
-  if (!sendForm.open) {
-    return `<section class="stack">
-      <button class="primary" id="new-send" type="button">New code</button>
-      ${error ? `<p class="error">${esc(error)}</p>` : ""}
-      ${notice ? `<p class="hint">${esc(notice)}</p>` : ""}
-    </section>`;
+function checkinBlock() {
+  if (!gig.live) {
+    if (!gig.ready) return `<p class="hint">Add a name, date, and picture before this event can go live.</p>`;
+    return `<button class="primary" id="go-live" type="button">Go live</button>`;
   }
+  return `<button class="primary" id="scanner-code" type="button">Generate scanner code</button>
+    ${scanner?.gigId === gig.id ? `<p class="join-code">${esc(scanner.code)}</p>
+      ${scanner.qr ? `<img class="door-qr" alt="Scanner code" src="${esc(scanner.qr)}">` : ""}
+      <p class="hint">This code works once, for one new phone, and lasts 24 hours. Ending check-in destroys it.</p>` : `<p class="hint">A scanner code is created when you ask for one. It lasts 24 hours, or until you end check-in.</p>`}
+    <h2>Signed-in scanners</h2>
+    ${scanners.length ? scanners.map((item) => `<div class="scanner-row"><span>Signed in ${esc(signedInLabel(item.signedInAt))}</span><button class="ghost" type="button" data-receiver="${esc(item.id)}">Disconnect</button></div>`).join("") : `<p class="hint">No scanners are signed in.</p>`}
+    <p class="hint">A scanner stays signed in for 24 hours. End check-in to sign every scanner out at once.</p>
+    ${confirmAction === "end" ? `<div class="confirm"><p>End check-in? Every scanner will be signed out, and unused scanner codes will stop working.</p><div class="actions"><button class="danger" id="end-live" type="button">End check-in</button><button class="ghost" id="cancel-confirm" type="button">Cancel</button></div></div>` : `<button class="danger" id="ask-end" type="button">End check-in</button>`}`;
+}
+
+function deleteBlock() {
+  if (!canDelete(gig)) return "";
+  if (confirmAction === "delete") {
+    return `<section class="panel"><div class="confirm"><p>Delete this event?</p><div class="actions"><button class="danger" id="delete-event" type="button">Delete event</button><button class="ghost" id="cancel-confirm" type="button">Cancel</button></div></div></section>`;
+  }
+  return `<section class="panel"><button class="danger" id="ask-delete" type="button">Delete event</button></section>`;
+}
+
+function sendView() {
+  if (sendForm.step === 2) return sendCodeView();
   const choices = sendForm.type === "tours" ? tours() : sendForm.type === "places" ? places(sendForm.placeKind) : gigs.filter((item) => item.name);
   const selected = sendForm.type === "tours" ? sendForm.tours : sendForm.type === "places" ? sendForm.names : sendForm.gigIds;
-  return `<section class="stack"><form class="stack" id="send-form">
-    <label>Name<input name="label" value="${esc(sendForm.label)}" placeholder="2027 World Tour" required></label>
-    <label>Add a group<select name="type">
+  const state = countState();
+  return `<form class="stack" id="who-form">
+    <h2>Who receives it</h2>
+    <label>Audience<select name="type">
       <option value="events" ${sendForm.type === "events" ? "selected" : ""}>Attendees of specific events</option>
-      <option value="tours" ${sendForm.type === "tours" ? "selected" : ""}>Attendees of specific tour/series</option>
-      <option value="places" ${sendForm.type === "places" ? "selected" : ""}>Fans from specified countries/cities</option>
-      <option value="all" ${sendForm.type === "all" ? "selected" : ""}>All fans</option>
+      <option value="tours" ${sendForm.type === "tours" ? "selected" : ""}>Attendees of a tour or series</option>
+      <option value="places" ${sendForm.type === "places" ? "selected" : ""}>Fans from cities or countries</option>
+      <option value="all" ${sendForm.type === "all" ? "selected" : ""}>${everyoneLabel}</option>
     </select></label>
-    ${sendForm.type === "places" ? `<p class="hint">A city includes people who registered at your event there, and people who registered with you anywhere and live there. Each person gets one code. If they match two cities, it is listed as their hometown.</p><label>Cities or countries<select name="placeKind">
+    ${sendForm.type === "places" ? `<p class="hint">A city or country includes people who registered at your event there, and people who registered with you and live there. Each person gets one code.</p><label>Cities or countries<select name="placeKind">
       <option value="city" ${sendForm.placeKind === "city" ? "selected" : ""}>Cities</option>
       <option value="country" ${sendForm.placeKind === "country" ? "selected" : ""}>Countries</option>
     </select></label>` : ""}
     ${sendForm.type === "all" ? "" : `<details class="drop" ${sendForm.menuOpen ? "open" : ""}>
-      <summary>${selected.length ? `${selected.length} selected` : "Choose"}</summary>
+      <summary id="pick-summary">${selected.length ? `${selected.length} selected` : "Choose"}</summary>
       <div class="drop-list">
         <button class="ghost sticky" id="select-all" type="button">Select all</button>
         ${choices.map((item) => {
@@ -377,53 +610,98 @@ function sendView() {
         }).join("") || `<p class="hint">Nothing to choose yet.</p>`}
       </div>
     </details>`}
-    <button class="ghost" id="add-group" type="button">Add group</button>
-    <ul class="groups">${sendForm.groups.map((group) => `<li><span>${esc(group.label)}</span><button type="button" data-remove="${esc(group.id)}" aria-label="Remove group">×</button></li>`).join("")}</ul>
+    ${sendForm.extra.length ? `<ul class="groups">${sendForm.extra.map((group) => `<li><span>${esc(group.label)}</span><button type="button" data-remove="${esc(group.id)}" aria-label="Remove audience">×</button></li>`).join("")}</ul>` : ""}
+    <button class="secondary" id="add-audience" type="button" ${currentAudience() ? "" : "hidden"}>Add another audience</button>
+    <p id="who-count" class="${state.ready ? "tally" : "hint"}">${esc(state.text)}</p>
+    <button class="primary" id="continue-send" type="button" ${state.ready ? "" : "disabled"}>Continue</button>
+  </form>`;
+}
+
+function sendCodeView() {
+  const preview = heldFiles.image;
+  return `<form class="stack" id="send-form">
+    <h2>The code</h2>
+    <button class="ghost" id="send-back" type="button">Back</button>
+    <p class="hint">${esc(audienceGroups().map((group) => group.label).join(" · "))}</p>
+    <p class="tally">${esc(peopleLabel(sendForm.count || 0))}</p>
+    <label>Name<input name="label" value="${esc(sendForm.label)}" placeholder="2027 World Tour" required></label>
     <label>Message<textarea name="message" required>${esc(sendForm.message)}</textarea></label>
     <fieldset class="choice-set"><legend>Code</legend>
       <label class="choice"><input name="format" type="radio" value="text" ${sendForm.inPerson ? "" : "checked"}> Text</label>
       <label class="choice"><input name="format" type="radio" value="qr" ${sendForm.inPerson ? "checked" : ""}> QR code</label>
     </fieldset>
-    <label>Tile picture<input name="image" type="file" accept="image/png,image/jpeg,image/webp" ${heldFiles.image ? "" : "required"}></label>
-    ${heldFiles.image ? `<p class="hint">Picture added.</p>` : ""}
+    <label>Tile picture<input name="image" type="file" accept="image/png,image/jpeg,image/webp" ${preview ? "" : "required"}></label>
+    ${preview ? `<img class="cover" alt="" src="${esc(preview)}">` : ""}
     <label>Expiry<input name="expires" type="date" value="${esc(sendForm.expires)}" required></label>
-    ${error ? `<p class="error">${esc(error)}</p>` : ""}
     <button class="primary" type="submit">Send codes</button>
-  </form></section>`;
+  </form>`;
+}
+
+function issuedMeta(item) {
+  const parts = [];
+  if (item.groups?.length) parts.push(item.groups.join(" · "));
+  parts.push(item.inPerson ? "QR code" : "Text");
+  parts.push(item.expiresAt ? `Expires ${when(item.expiresAt)}` : "No expiry");
+  return parts.join(" · ");
 }
 
 function issuedView() {
-  return `<section class="stack">
-    ${error ? `<p class="error">${esc(error)}</p>` : ""}
-    ${issued.length ? `<p class="hint">Downloads are SHA-256 hashes of the codes, for the ticket seller. Fans still see the real code in the app.</p><ul class="issued">${issued.map((item) => `<li>
-      ${item.image ? `<img alt="" src="${esc(item.image)}">` : ""}
-      <div><strong>${esc(item.label)}</strong><p>${esc(item.message)}</p><p class="hint">${item.count} people${item.groups?.length ? ` · ${esc(item.groups.join(" · "))}` : ""} · ${item.inPerson ? "QR code" : "Text"} · ${item.expiresAt ? `Expires ${esc(when(item.expiresAt))}` : "No expiry"}</p>${item.filename ? `<button class="ghost" type="button" data-csv="${esc(item.id)}" data-filename="${esc(item.filename)}">${esc(item.filename)}</button>` : ""}</div>
-    </li>`).join("")}</ul>` : `<p class="hint">Codes you send will be listed here.</p>`}
-  </section>`;
+  if (!issued.length) return `<p class="hint">Codes you send will be listed here.</p>`;
+  return `<ul class="issued">${issued.map((item) => `<li>
+    ${item.image ? `<img alt="" src="${esc(item.image)}">` : ""}
+    <div class="issued-main">
+      <strong>${esc(item.label)}</strong>
+      <p class="issued-count">${esc(peopleLabel(item.count))}</p>
+      ${item.message ? `<p class="hint">${esc(item.message)}</p>` : ""}
+      <p class="hint">${esc(issuedMeta(item))}</p>
+      ${item.filename ? `<button class="ghost" type="button" data-csv="${esc(item.id)}" data-filename="${esc(item.filename)}">Download</button>` : ""}
+    </div>
+  </li>`).join("")}</ul>`;
 }
 
 function profileView() {
-  return `<section class="stack"><form class="stack" id="profile">
-    ${me?.profileImage ? `<img class="profile-pic" alt="" src="${esc(me.profileImage)}">` : ""}
-    <label>Name<input name="name" value="${esc(me?.name)}" required></label>
-    <label>You are a<select name="kind">${kinds.map(([value, label]) => `<option value="${value}" ${me?.kind === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+  const seconds = joinSeconds();
+  const name = profileDraft?.name ?? me?.name ?? "";
+  const kind = profileDraft?.kind ?? me?.kind ?? "band";
+  const picture = heldFiles.picture || me?.profileImage || "";
+  return `<section class="panel">
+    <h2>Event code</h2>
+    <p class="hint">This is the code another organisation types to add you to their bill.</p>
+    <button class="primary" id="new-code" type="button">Generate event code</button>
+    ${joinCode ? `<p class="join-code">${esc(joinCode)}</p><p class="hint" id="join-left">${seconds}s</p>` : ""}
+  </section>
+  <section class="panel"><form class="stack" id="profile">
+    <h2>Account</h2>
+    ${picture ? `<img class="profile-pic" alt="" src="${esc(picture)}">` : ""}
+    <label>Name<input name="name" value="${esc(name)}" required></label>
+    <label>You are a<select name="kind">${kinds.map(([value, label]) => `<option value="${value}" ${kind === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
     <label>Profile picture<input name="picture" type="file" accept="image/png,image/jpeg,image/webp"></label>
-    <label>Password<input name="currentPassword" type="password" autocomplete="current-password" required></label>
-    ${heldFiles.picture ? `<p class="hint">Picture added.</p>` : ""}
-    ${error ? `<p class="error">${esc(error)}</p>` : ""}
-    ${notice ? `<p class="hint">${esc(notice)}</p>` : ""}
     <button class="primary" type="submit">Save profile</button>
   </form></section>`;
 }
 
 function bindAuth() {
-  document.querySelector("#to-signup")?.addEventListener("click", () => { view = "signup"; error = ""; render(); });
-  document.querySelector("#to-login")?.addEventListener("click", () => { view = "login"; error = ""; render(); });
+  document.querySelector("#to-signup")?.addEventListener("click", () => { view = "signup"; error = ""; notice = ""; render(); });
+  document.querySelector("#to-login")?.addEventListener("click", () => {
+    view = "login";
+    pendingEmail = "";
+    sessionStorage.removeItem("ticketid.org.pending");
+    error = "";
+    render();
+  });
   document.querySelector("#login")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
       const result = await api("/api/org/login", { method: "POST", body: { email: form.get("email"), password: form.get("password") } });
+      if (result.needsVerify) {
+        pendingEmail = result.email;
+        sessionStorage.setItem("ticketid.org.pending", pendingEmail);
+        error = "";
+        render();
+        return;
+      }
+      if (!result.token) throw new Error("Sign in to continue.");
       token = result.token;
       localStorage.setItem(tokenKey, token);
       error = "";
@@ -450,6 +728,14 @@ function bindAuth() {
     }
     try {
       const result = await api("/api/org/signup", { method: "POST", body });
+      if (result.needsVerify) {
+        pendingEmail = result.email;
+        sessionStorage.setItem("ticketid.org.pending", pendingEmail);
+        error = "";
+        render();
+        return;
+      }
+      if (!result.token) throw new Error("Sign in to continue.");
       token = result.token;
       localStorage.setItem(tokenKey, token);
       pendingEmail = "";
@@ -469,6 +755,7 @@ function bindAuth() {
       pendingEmail = "";
       sessionStorage.removeItem("ticketid.org.pending");
       view = "login";
+      notice = "Email confirmed. Log in to continue.";
       error = "";
       render();
     } catch (cause) {
@@ -488,51 +775,79 @@ function readDraft(form) {
   draft.bio = String(data.get("bio") || "");
   draft.city = String(data.get("city") || "");
   draft.country = String(data.get("country") || "");
-  draft.tourPick = String(data.get("tourPick") || "__new");
+  const picked = data.get("tourPick");
+  draft.tourPick = picked == null ? draft.tourPick : String(picked);
   if (draft.tourPick === "__new") draft.tourName = String(data.get("tourName") || "");
 }
 
+function readSend(form) {
+  const data = new FormData(form);
+  sendForm.label = String(data.get("label") || "");
+  sendForm.message = String(data.get("message") || "");
+  sendForm.expires = String(data.get("expires") || "");
+  const format = data.get("format");
+  if (format) sendForm.inPerson = format === "qr";
+}
+
+function readProfile(form) {
+  if (!form) return;
+  const data = new FormData(form);
+  profileDraft = { name: String(data.get("name") || ""), kind: String(data.get("kind") || me?.kind || "band") };
+}
+
+function selectionKey() {
+  if (sendForm.type === "tours") return "tours";
+  if (sendForm.type === "places") return "names";
+  return "gigIds";
+}
+
+function paintSummary() {
+  const summary = document.querySelector("#pick-summary");
+  if (!summary) return;
+  const selected = sendForm[selectionKey()];
+  summary.textContent = selected.length ? `${selected.length} selected` : "Choose";
+}
+
 function bindApp() {
-  document.querySelector("#signout")?.addEventListener("click", async () => {
+  document.querySelectorAll("[data-signout]").forEach((button) => button.addEventListener("click", async () => {
     await api("/api/logout", { method: "POST", token, body: {} }).catch(() => undefined);
     localStorage.removeItem(tokenKey);
     token = null;
     gig = null;
-    render();
-  });
-  document.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", async () => {
-    page = button.dataset.page;
+    scanner = null;
+    scanners = [];
+    joinCode = "";
+    clearInterval(joinTimer);
     error = "";
     notice = "";
-    scanner = null;
-    if (page === "events") hideCompleted = true;
-    if (page === "issued") issued = await api("/api/codes", { token }).catch(() => []);
-    if (page === "send") audiencePlaces = await api("/api/places", { token }).catch(() => ({ cities: [], countries: [] }));
-    if (page === "create") draft = blankDraft();
-    holdGeneration += 1;
-    heldFiles.image = "";
-    heldFiles.picture = "";
+    history.replaceState(null, "", `${location.pathname}${location.search}`);
     render();
   }));
+  document.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", () => {
+    const next = button.dataset.page;
+    error = "";
+    notice = "";
+    goRoute({ page: next, id: "" }, { fresh: next === "create" || next === "send" || next === "profile" });
+  }));
+  document.querySelector("#go-create")?.addEventListener("click", () => {
+    error = "";
+    notice = "";
+    goRoute({ page: "create", id: "" }, { fresh: true });
+  });
   document.querySelector("#new-code")?.addEventListener("click", async () => {
+    readProfile(document.querySelector("#profile"));
     try {
       const result = await api("/api/org/join-code", { method: "POST", token, body: {} });
       joinCode = result.code;
       joinExpires = new Date(result.expiresAt).getTime();
       error = "";
-      clearInterval(joinTimer);
-      joinTimer = setInterval(() => {
-        if (Date.now() >= joinExpires) {
-          joinCode = "";
-          clearInterval(joinTimer);
-        }
-        if (page === "home") render();
-      }, 1000);
+      startJoinClock();
     } catch (cause) {
       error = cause.message;
     }
     render();
   });
+  document.querySelector("#create-event")?.addEventListener("input", (event) => readDraft(event.currentTarget));
   document.querySelector("#create-event")?.addEventListener("change", (event) => {
     const form = event.currentTarget;
     readDraft(form);
@@ -542,7 +857,16 @@ function bindApp() {
         draft.copyFrom = "";
         draft.copyLabel = "";
       } else {
-        draft = { ...blankDraft(), name: source.name || "", bio: source.bio || "", city: source.city || "", country: source.country || "", tourPick: source.tourName || "__new", tourName: "", copyFrom: source.id, copyLabel: source.name || "the previous event" };
+        draft = {
+          ...blankDraft(),
+          name: source.name || "",
+          bio: source.bio || "",
+          city: source.city || "",
+          country: source.country || "",
+          tourPick: source.tourName || "",
+          copyFrom: source.id,
+          copyLabel: source.name || "the previous event",
+        };
       }
       render();
       return;
@@ -553,8 +877,18 @@ function bindApp() {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     readDraft(event.currentTarget);
+    if (!draft.date || !draft.time) {
+      error = "Enter the date and start time.";
+      render();
+      return;
+    }
     try {
       const image = await chosenImage("image", form.get("image"));
+      if (!image && !draft.copyFrom) {
+        error = "Add a picture.";
+        render();
+        return;
+      }
       const tourName = draft.tourPick === "__new" ? draft.tourName : draft.tourPick;
       gig = await api("/api/gigs", {
         method: "POST",
@@ -571,49 +905,37 @@ function bindApp() {
           ...(draft.copyFrom ? { copyFrom: draft.copyFrom } : {}),
         },
       });
-      gigs = await api("/api/gigs", { token });
-      scanners = gig.owner ? await api(`/api/gigs/${gig.id}/receivers`, { token }) : [];
-      page = "event";
       heldFiles.image = "";
-      error = "";
+      draft = blankDraft();
       notice = "Event created.";
-      render();
+      error = "";
+      await goRoute({ page: "event", id: gig.id });
     } catch (cause) {
       error = cause.message;
       render();
     }
   });
-  document.querySelector("#hide-completed")?.addEventListener("change", (event) => {
-    hideCompleted = event.currentTarget.checked;
+  document.querySelector("#show-past")?.addEventListener("change", (event) => {
+    showPast = event.currentTarget.checked;
     render();
   });
-  document.querySelectorAll("[data-gig]").forEach((button) => button.addEventListener("click", async () => {
-    try {
-      gig = await api(`/api/gigs/${button.dataset.gig}`, { token });
-      scanner = null;
-      scanners = gig.owner ? await api(`/api/gigs/${gig.id}/receivers`, { token }) : [];
-      page = "event";
-      error = "";
-      notice = "";
-      render();
-    } catch (cause) {
-      error = cause.message;
-      render();
-    }
+  document.querySelectorAll("[data-gig]").forEach((button) => button.addEventListener("click", () => {
+    error = "";
+    notice = "";
+    goRoute({ page: "event", id: button.dataset.gig });
   }));
   document.querySelector("#add-member")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
       gig = await api(`/api/gigs/${gig.id}/members`, { method: "POST", token, body: { code: form.get("code") } });
-      gigs = await api("/api/gigs", { token });
+      gigs = gigs.map((item) => item.id === gig.id ? { ...item, ...gig } : item);
       notice = "Added to the event.";
       error = "";
-      render();
     } catch (cause) {
       error = cause.message;
-      render();
     }
+    render();
   });
   document.querySelectorAll("[data-receiver]").forEach((button) => {
     button.addEventListener("click", async () => {
@@ -639,67 +961,95 @@ function bindApp() {
     }
     render();
   });
+  document.querySelector("#ask-delete")?.addEventListener("click", () => {
+    confirmAction = "delete";
+    render();
+  });
+  document.querySelector("#ask-end")?.addEventListener("click", () => {
+    confirmAction = "end";
+    render();
+  });
+  document.querySelector("#cancel-confirm")?.addEventListener("click", () => {
+    confirmAction = "";
+    render();
+  });
   document.querySelector("#delete-event")?.addEventListener("click", async () => {
-    if (!window.confirm("Delete this event?")) return;
     try {
       await api(`/api/gigs/${gig.id}`, { method: "DELETE", token });
-      gigs = await api("/api/gigs", { token });
       gig = null;
       scanner = null;
-      page = "events";
-      hideCompleted = true;
-      error = "";
+      scanners = [];
+      confirmAction = "";
       notice = "Event deleted.";
+      error = "";
+      await goRoute({ page: "events", id: "" });
     } catch (cause) {
       error = cause.message;
+      render();
     }
-    render();
   });
   document.querySelector("#go-live")?.addEventListener("click", async () => {
     try {
       gig = await api(`/api/gigs/${gig.id}/live`, { method: "POST", token, body: {} });
-      gigs = await api("/api/gigs", { token });
+      gigs = gigs.map((item) => item.id === gig.id ? { ...item, ...gig } : item);
       scanners = [];
       notice = "This event is live.";
       error = "";
-      render();
     } catch (cause) {
       error = cause.message;
-      render();
     }
-  });
-  document.querySelector("#new-send")?.addEventListener("click", async () => {
-    sendForm = { ...blankSend(), open: true };
-    error = "";
-    notice = "";
-    audiencePlaces = await api("/api/places", { token }).catch(() => ({ cities: [], countries: [] }));
     render();
   });
-  document.querySelector("#send-form")?.addEventListener("change", (event) => {
-    const form = event.currentTarget;
-    const data = new FormData(form);
-    sendForm.label = String(data.get("label") || "");
-    sendForm.message = String(data.get("message") || "");
-    sendForm.expires = String(data.get("expires") || "");
-    sendForm.inPerson = data.get("format") === "qr";
+  document.querySelector("#end-live")?.addEventListener("click", async () => {
+    try {
+      gig = await api(`/api/gigs/${gig.id}/live`, { method: "DELETE", token });
+      gigs = gigs.map((item) => item.id === gig.id ? { ...item, ...gig } : item);
+      scanner = null;
+      scanners = [];
+      confirmAction = "";
+      notice = "Check-in has ended.";
+      error = "";
+    } catch (cause) {
+      error = cause.message;
+    }
+    render();
+  });
+  document.querySelector("#send-to-event")?.addEventListener("click", () => {
+    sendForm = { ...blankSend(), type: "events", gigIds: gig?.id ? [gig.id] : [], menuOpen: true };
+    heldFiles.image = "";
+    error = "";
+    notice = "";
+    goRoute({ page: "send", id: "" });
+  });
+  document.querySelector("#who-form")?.addEventListener("submit", (event) => event.preventDefault());
+  document.querySelector("#who-form")?.addEventListener("change", (event) => {
     if (event.target.name === "type") {
-      sendForm.type = String(data.get("type"));
+      sendForm.type = String(event.target.value);
       sendForm.gigIds = [];
       sendForm.tours = [];
       sendForm.names = [];
       sendForm.menuOpen = false;
+      sendForm.count = null;
       render();
+      refreshCount();
+      return;
     }
     if (event.target.name === "placeKind") {
-      sendForm.placeKind = String(data.get("placeKind"));
+      sendForm.placeKind = String(event.target.value);
       sendForm.names = [];
       sendForm.menuOpen = true;
+      sendForm.count = null;
       render();
+      refreshCount();
+      return;
     }
     if (event.target.dataset.pick) {
       const id = event.target.dataset.pick;
-      const key = sendForm.type === "tours" ? "tours" : sendForm.type === "places" ? "names" : "gigIds";
+      const key = selectionKey();
       sendForm[key] = event.target.checked ? [...new Set([...sendForm[key], id])] : sendForm[key].filter((item) => item !== id);
+      sendForm.menuOpen = true;
+      paintSummary();
+      refreshCount();
     }
   });
   document.querySelector(".drop")?.addEventListener("toggle", (event) => {
@@ -708,82 +1058,125 @@ function bindApp() {
   document.querySelector("#select-all")?.addEventListener("click", () => {
     const boxes = [...document.querySelectorAll("[data-pick]")];
     const allOn = boxes.length > 0 && boxes.every((box) => box.checked);
-    const key = sendForm.type === "tours" ? "tours" : sendForm.type === "places" ? "names" : "gigIds";
+    const key = selectionKey();
     sendForm[key] = allOn ? [] : boxes.map((box) => box.dataset.pick);
+    boxes.forEach((box) => { box.checked = !allOn; });
     sendForm.menuOpen = true;
-    render();
+    paintSummary();
+    refreshCount();
   });
-  document.querySelector("#add-group")?.addEventListener("click", () => {
-    const id = String(Date.now());
-    if (sendForm.type === "all") sendForm.groups.push({ id, type: "all", label: "All fans" });
-    else if (sendForm.type === "events" && sendForm.gigIds.length) {
-      const names = gigs.filter((item) => sendForm.gigIds.includes(item.id)).map((item) => eventChoiceLabel(item)).join(" · ");
-      sendForm.groups.push({ id, type: "events", gigIds: [...sendForm.gigIds], label: `Events: ${names}` });
-    } else if (sendForm.type === "tours" && sendForm.tours.length) sendForm.groups.push({ id, type: "tours", tours: [...sendForm.tours], label: `Tours: ${sendForm.tours.join(", ")}` });
-    else if (sendForm.type === "places" && sendForm.names.length) sendForm.groups.push({ id, type: "places", names: [...sendForm.names], label: `${sendForm.placeKind === "country" ? "Countries" : "Cities"}: ${sendForm.names.join(", ")}` });
-    else {
+  document.querySelector("#add-audience")?.addEventListener("click", () => {
+    const group = currentAudience();
+    if (!group) {
       error = "Choose at least one.";
       render();
       return;
     }
+    sendForm.extra.push({ ...group, id: String(Date.now()) });
+    sendForm.type = "events";
+    sendForm.gigIds = [];
+    sendForm.tours = [];
+    sendForm.names = [];
+    sendForm.menuOpen = false;
+    sendForm.count = null;
+    error = "";
+    render();
+    refreshCount();
+  });
+  document.querySelectorAll("[data-remove]").forEach((button) => button.addEventListener("click", () => {
+    sendForm.extra = sendForm.extra.filter((group) => group.id !== button.dataset.remove);
+    sendForm.count = null;
+    error = "";
+    render();
+    refreshCount();
+  }));
+  document.querySelector("#continue-send")?.addEventListener("click", () => {
+    if (!countState().ready) return;
+    sendForm.step = 2;
     error = "";
     render();
   });
-  document.querySelectorAll("[data-remove]").forEach((button) => button.addEventListener("click", () => {
-    sendForm.groups = sendForm.groups.filter((group) => group.id !== button.dataset.remove);
+  document.querySelector("#send-back")?.addEventListener("click", () => {
+    readSend(document.querySelector("#send-form"));
+    sendForm.step = 1;
+    error = "";
     render();
-  }));
+    refreshCount();
+  });
+  document.querySelector("#send-form")?.addEventListener("input", (event) => readSend(event.currentTarget));
+  document.querySelector("#send-form")?.addEventListener("change", (event) => {
+    readSend(event.currentTarget);
+  });
   document.querySelector("#send-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    if (!sendForm.groups.length) {
-      error = "Add at least one group.";
+    readSend(event.currentTarget);
+    const groups = payloadGroups();
+    if (!groups.length) {
+      error = "Choose who should receive this code.";
+      sendForm.step = 1;
       render();
       return;
     }
     try {
       const image = await chosenImage("image", form.get("image"));
+      if (!image) {
+        error = "Add a picture.";
+        render();
+        return;
+      }
       const result = await api("/api/codes", {
         method: "POST",
         token,
         body: {
-          label: form.get("label"),
-          message: form.get("message"),
-          inPerson: form.get("format") === "qr",
-          expiresAt: form.get("expires"),
+          label: sendForm.label,
+          message: sendForm.message,
+          inPerson: sendForm.inPerson,
+          expiresAt: sendForm.expires,
           image,
-          groups: sendForm.groups.map(({ type, gigIds, tours, names, label: groupLabel }) => ({ type, gigIds, tours, names, label: groupLabel })),
+          groups,
         },
       });
       sendForm = blankSend();
       heldFiles.image = "";
-      notice = `Sent to ${result.count} people.`;
+      notice = `Sent to ${peopleLabel(result.count)}.`;
       error = "";
-      issued = await api("/api/codes", { token });
-      page = "issued";
-      render();
+      await goRoute({ page: "issued", id: "" });
     } catch (cause) {
       error = cause.message;
       render();
     }
   });
+  document.querySelector("#profile")?.addEventListener("input", (event) => readProfile(event.currentTarget));
+  document.querySelector("#profile")?.addEventListener("change", (event) => readProfile(event.currentTarget));
   document.querySelector("#profile")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    readProfile(event.currentTarget);
     try {
       const picture = await chosenImage("picture", form.get("picture"));
-      me = await api("/api/org/me", { method: "PATCH", token, body: { name: form.get("name"), kind: form.get("kind"), currentPassword: form.get("currentPassword"), ...(picture ? { profileImage: picture } : {}) } });
+      me = await api("/api/org/me", {
+        method: "PATCH",
+        token,
+        body: { name: profileDraft.name, kind: profileDraft.kind, ...(picture ? { profileImage: picture } : {}) },
+      });
       heldFiles.picture = "";
+      profileDraft = null;
       notice = "Profile saved.";
       error = "";
-      render();
     } catch (cause) {
       error = cause.message;
-      render();
     }
+    render();
   });
   document.querySelectorAll("input[type=file]").forEach((input) => {
-    input.addEventListener("change", () => { holdFile(input); });
+    input.addEventListener("change", () => {
+      const form = input.form;
+      if (form?.id === "create-event") readDraft(form);
+      if (form?.id === "send-form") readSend(form);
+      if (form?.id === "profile") readProfile(form);
+      holdFile(input);
+    });
   });
   document.querySelectorAll("[data-csv]").forEach((button) => {
     button.addEventListener("click", () => downloadRelease(button.dataset.csv, button.dataset.filename));
@@ -814,12 +1207,67 @@ async function downloadRelease(batchId, filename) {
   }
 }
 
+async function goRoute(route, options = {}) {
+  const generation = ++routeGeneration;
+  page = route.page;
+  confirmAction = "";
+  if (options.fresh) resetPageDraft(page);
+  try {
+    if (page === "event" || page === "events" || page === "create" || page === "send") {
+      gigs = await api("/api/gigs", { token });
+      if (generation !== routeGeneration) return;
+    }
+    if (page === "issued") {
+      issued = await api("/api/codes", { token });
+      if (generation !== routeGeneration) return;
+    }
+    if (page === "send") {
+      audiencePlaces = await api("/api/places", { token }).catch(() => ({ cities: [], countries: [] }));
+      if (generation !== routeGeneration) return;
+    }
+    if (page === "event") {
+      const id = route.id || upcomingId();
+      if (!id) {
+        gig = null;
+        scanner = null;
+        scanners = [];
+      } else {
+        gig = await api(`/api/gigs/${id}`, { token });
+        if (generation !== routeGeneration) return;
+        if (scanner && scanner.gigId !== gig.id) scanner = null;
+        scanners = gig.owner ? await api(`/api/gigs/${gig.id}/receivers`, { token }) : [];
+        if (generation !== routeGeneration) return;
+        gigs = gigs.map((item) => item.id === gig.id ? { ...item, ...gig } : item);
+      }
+    }
+    if (generation !== routeGeneration) return;
+    writeRoute();
+    render();
+    if (page === "send" && sendForm.step === 1) refreshCount();
+  } catch (cause) {
+    if (generation !== routeGeneration) return;
+    error = cause.message;
+    if (page === "event") {
+      gig = null;
+      scanners = [];
+    }
+    writeRoute();
+    render();
+  }
+}
+
 async function load() {
   me = await api("/api/org/me", { token });
   gigs = await api("/api/gigs", { token });
-  page = "home";
-  render();
+  await goRoute(readRoute());
 }
+
+window.addEventListener("hashchange", () => {
+  if (!token) return;
+  error = "";
+  notice = "";
+  goRoute(readRoute());
+});
 
 if (token) load().catch((cause) => {
   if (cause?.status === 401) {

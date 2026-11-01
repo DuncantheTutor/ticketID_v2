@@ -1,4 +1,4 @@
-const { createHash, randomBytes, randomUUID, timingSafeEqual } = require("node:crypto");
+const { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } = require("node:crypto");
 const express = require("express");
 const admin = require("firebase-admin");
 const QRCode = require("qrcode");
@@ -22,6 +22,10 @@ const collections = [
   "deviceTokens",
   "deviceBinds",
   "receiverSessions",
+  "emailCodes",
+  "deviceChallenges",
+  "phoneKeys",
+  "rateLimits",
 ];
 
 let db;
@@ -59,6 +63,17 @@ function code(length) {
   return out;
 }
 
+function pin(length = 6) {
+  let out = "";
+  for (let index = 0; index < length; index += 1) out += String(randomInt(10));
+  return out;
+}
+
+function otpTtlMs() {
+  const value = Number(process.env.OTP_MS || 10 * 60 * 1000);
+  return Number.isFinite(value) && value > 0 ? value : 10 * 60 * 1000;
+}
+
 function sha(value) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -74,6 +89,11 @@ function deviceLockMs() {
 
 function receiverTtlMs() {
   const value = Number(process.env.RECEIVER_MS || 24 * 60 * 60 * 1000);
+  return Number.isFinite(value) && value > 0 ? value : 24 * 60 * 60 * 1000;
+}
+
+function scannerTtlMs() {
+  const value = Number(process.env.SCANNER_MS || 24 * 60 * 60 * 1000);
   return Number.isFinite(value) && value > 0 ? value : 24 * 60 * 60 * 1000;
 }
 
@@ -133,6 +153,52 @@ function optionalPlace(value) {
 
 function phoneKey(value) {
   return String(value ?? "").replace(/\D/g, "").replace(/^0+/, "").replace(/^44/, "");
+}
+
+function e164(phone) {
+  const raw = String(phone ?? "").trim();
+  let digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
+  if (raw.startsWith("+")) return `+${digits}`;
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  if (digits.startsWith("0")) digits = `44${digits.slice(1)}`;
+  else if (!digits.startsWith("44")) digits = `44${digits}`;
+  return `+${digits}`;
+}
+
+function rateWindowMs() {
+  const value = Number(process.env.RATE_LIMIT_MS || 15 * 60 * 1000);
+  return Number.isFinite(value) && value > 0 ? value : 15 * 60 * 1000;
+}
+
+function rateMax() {
+  const value = Number(process.env.RATE_LIMIT_MAX || 5);
+  return Number.isFinite(value) && value > 0 ? value : 5;
+}
+
+function clientIp(request) {
+  const forwarded = String(request.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  if (forwarded) return forwarded;
+  return String(request.ip || request.socket?.remoteAddress || "local");
+}
+
+async function enforceRateLimit(key) {
+  const id = sha(key);
+  const now = Date.now();
+  const windowMs = rateWindowMs();
+  const max = rateMax();
+  const ref = db.collection("rateLimits").doc(id);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const row = snap.exists ? snap.data() : null;
+    const resetAt = row?.resetAt ? new Date(row.resetAt).getTime() : 0;
+    if (!row || !Number.isFinite(resetAt) || resetAt <= now) {
+      tx.set(ref, { count: 1, resetAt: new Date(now + windowMs).toISOString() });
+      return;
+    }
+    if ((row.count || 0) >= max) throw fail(429, "Wait a moment, then try again.");
+    tx.update(ref, { count: (row.count || 0) + 1 });
+  });
 }
 
 function placeKeys(city, country) {
@@ -294,6 +360,7 @@ function publicFan(fan) {
     city: fan.city || null,
     country: fan.country || null,
     registeredOnly: fan.registeredOnly === true,
+    emailVerified: fan.emailVerified === true,
   };
 }
 
@@ -304,6 +371,7 @@ function publicOrg(org) {
     name: org.name,
     email: org.email,
     profileImage: org.profileImage ? `/media/${org.profileImage}` : null,
+    emailVerified: org.emailVerified === true,
   };
 }
 
@@ -321,7 +389,12 @@ function membersOf(gig) {
   })).sort((left, right) => String(left.name).localeCompare(String(right.name)));
 }
 
-function gigView(gig, orgId) {
+async function registrationCount(gigId) {
+  const snap = await db.collection("registrations").where("gigId", "==", gigId).get();
+  return snap.size;
+}
+
+async function gigView(gig, orgId) {
   return {
     id: gig.id,
     name: gig.name,
@@ -333,6 +406,7 @@ function gigView(gig, orgId) {
     image: gig.image ? `/media/${gig.image}` : null,
     ready: gigReady(gig),
     live: gig.live === true,
+    registered: await registrationCount(gig.id),
     members: membersOf(gig),
     owner: gig.creatorOrgId === orgId,
   };
@@ -407,22 +481,278 @@ async function reserveUsername(uid, username, previousLower) {
   });
 }
 
-async function rollbackAccount(uid, username) {
+async function rollbackAccount(uid, username, phone) {
   if (username) {
     const ref = db.collection("usernames").doc(username.toLowerCase());
     const snap = await ref.get();
     if (snap.exists && snap.data().uid === uid) await ref.delete();
   }
+  if (phone) {
+    const ref = db.collection("phoneKeys").doc(phoneKey(phone));
+    const snap = await ref.get();
+    if (snap.exists && snap.data().uid === uid) await ref.delete();
+  }
+  const binds = await db.collection("deviceBinds").where("fanId", "==", uid).get();
+  await deleteDocs(binds.docs);
   await db.collection("fans").doc(uid).delete().catch(() => undefined);
   await db.collection("orgs").doc(uid).delete().catch(() => undefined);
   await admin.auth().deleteUser(uid).catch(() => undefined);
 }
 
-async function createAuthUser(email, password) {
+async function reservePhone(uid, phone, previousKey) {
+  const key = phoneKey(phone);
+  await db.runTransaction(async (tx) => {
+    const ref = db.collection("phoneKeys").doc(key);
+    const snap = await tx.get(ref);
+    if (snap.exists && snap.data().uid !== uid) throw fail(400, "That phone number is already registered.");
+    if (previousKey && previousKey !== key) tx.delete(db.collection("phoneKeys").doc(previousKey));
+    tx.set(ref, { uid });
+  });
+}
+
+function phoneHint(phone) {
+  const digits = String(phone ?? "").replace(/\D/g, "");
+  if (digits.length < 4) return "";
+  return digits.slice(-4);
+}
+
+async function sessionFromUid(uid, actor) {
+  const custom = await admin.auth().createCustomToken(uid);
+  const signed = await identity("accounts:signInWithCustomToken", { token: custom, returnSecureToken: true });
+  return sessionWithActor({ idToken: signed.idToken, refreshToken: signed.refreshToken }, actor, "Sign in to continue.");
+}
+
+async function appVerifyLink(email) {
+  let link = "";
   try {
-    return await admin.auth().createUser({ email, password });
+    link = await admin.auth().generateEmailVerificationLink(email, { url: `${publicOrigin()}/verify` });
+  } catch {
+    throw fail(503, "Email confirmation is not set up yet.");
+  }
+  let oobCode = "";
+  try {
+    oobCode = new URL(link).searchParams.get("oobCode") || "";
+  } catch {
+    oobCode = "";
+  }
+  if (!oobCode) throw fail(503, "Email confirmation is not set up yet.");
+  return `${publicOrigin()}/verify?oobCode=${encodeURIComponent(oobCode)}`;
+}
+
+async function sendVerifyEmail(uid, email, actor) {
+  const code = pin();
+  await db.collection("emailCodes").doc(sha(`${actor}:${email}`)).set({
+    uid,
+    actor,
+    email,
+    codeHash: sha(code),
+    expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+  });
+  let appLink = `${publicOrigin()}/verify`;
+  try {
+    appLink = await appVerifyLink(email);
+  } catch {
+    /* The short code still works. */
+  }
+  await rememberMail(email, "Confirm your email", `Confirm your email for ticketID.\n\n${appLink}\n\nYour ticketID code is ${code}\n`);
+  if (!usingEmulator()) {
+    try {
+      const custom = await admin.auth().createCustomToken(uid);
+      const signed = await identity("accounts:signInWithCustomToken", { token: custom, returnSecureToken: true });
+      await identity("accounts:sendOobCode", {
+        requestType: "VERIFY_EMAIL",
+        idToken: signed.idToken,
+        continueUrl: `${publicOrigin()}/verify`,
+      });
+    } catch {
+      /* The short code still works in the emulator, and the link still works if Firebase email is on. */
+    }
+  }
+}
+
+async function findAccountByEmail(email) {
+  const address = cleanEmail(email);
+  if (!address) return null;
+  for (const [name, actor] of [["fans", "fan"], ["orgs", "org"]]) {
+    const current = await db.collection(name).where("email", "==", address).limit(1).get();
+    if (!current.empty) return { uid: current.docs[0].id, actor, row: docData(current.docs[0]) };
+    const pending = await db.collection(name).where("pendingEmail", "==", address).limit(1).get();
+    if (!pending.empty) return { uid: pending.docs[0].id, actor, row: docData(pending.docs[0]) };
+  }
+  return null;
+}
+
+async function markVerified(uid, actor, confirmedEmail) {
+  const name = actor === "org" ? "orgs" : "fans";
+  const row = await getDoc(name, uid);
+  if (!row) throw fail(400, "That link has expired. Send a new one.");
+  const confirmed = cleanEmail(confirmedEmail || row.pendingEmail || row.email);
+  const nextEmail = row.pendingEmail && confirmed === cleanEmail(row.pendingEmail) ? row.pendingEmail : row.email;
+  if (nextEmail !== row.email) {
+    const taken = await db.collection(name).where("email", "==", nextEmail).limit(1).get();
+    if (!taken.empty && taken.docs[0].id !== uid) throw fail(400, "That email is already registered.");
+  }
+  await admin.auth().updateUser(uid, { email: nextEmail, emailVerified: true }).catch(() => undefined);
+  await db.collection(name).doc(uid).update({ email: nextEmail, emailVerified: true, pendingEmail: null });
+}
+
+async function confirmEmail(body) {
+  const oobCode = String(body.oobCode ?? "").trim();
+  const code = String(body.code ?? "").trim();
+  let email = cleanEmail(body.email);
+  let uid = "";
+  let actor = body.actor === "org" ? "org" : "fan";
+  if (oobCode) {
+    try {
+      const result = await identity("accounts:update", { oobCode });
+      email = cleanEmail(result.email);
+    } catch {
+      throw fail(400, "That link has expired. Send a new one.");
+    }
+    const found = await findAccountByEmail(email);
+    if (!found) throw fail(400, "That link has expired. Send a new one.");
+    uid = found.uid;
+    actor = found.actor;
+  } else if (code && email) {
+    const order = actor === "org" ? ["org", "fan"] : ["fan", "org"];
+    let row = null;
+    for (const kind of order) {
+      const found = await getDoc("emailCodes", sha(`${kind}:${email}`));
+      if (found) {
+        row = found;
+        actor = kind;
+        break;
+      }
+    }
+    if (!row || !sameCode(sha(code), row.codeHash)) throw fail(400, "That code is not right.");
+    if (row.expiresAt && new Date(row.expiresAt).getTime() <= Date.now()) throw fail(400, "That code has expired. Send a new one.");
+    uid = row.uid;
+    await db.collection("emailCodes").doc(sha(`${actor}:${email}`)).delete().catch(() => undefined);
+  } else {
+    throw fail(400, "Enter the code from the email.");
+  }
+  await markVerified(uid, actor, email);
+  return { ok: true, email, actor };
+}
+
+async function resendVerify(body) {
+  const email = cleanEmail(body.email);
+  if (!email) throw fail(400, "Enter the email address on the account.");
+  const actor = body.actor === "org" ? "org" : "fan";
+  const found = await findAccountByEmail(email);
+  if (found && found.actor === actor && found.row.emailVerified !== true) {
+    await sendVerifyEmail(found.uid, email, actor);
+  } else if (found && found.actor === actor && found.row.pendingEmail === email) {
+    await sendVerifyEmail(found.uid, email, actor);
+  }
+  return { ok: true };
+}
+
+async function emulatorPhoneCode(phone) {
+  const host = process.env.FIREBASE_AUTH_EMULATOR_HOST;
+  if (!host) return "";
+  const project = process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "demo-ticketid";
+  const number = e164(phone);
+  try {
+    const response = await fetch(`http://${host}/emulator/v1/projects/${project}/verificationCodes`);
+    const data = await response.json().catch(() => ({}));
+    const rows = data.verificationCodes || [];
+    const match = rows.filter((row) => e164(row.phoneNumber || "") === number);
+    const row = match[match.length - 1] || rows[rows.length - 1];
+    return String(row?.code || "");
+  } catch {
+    return "";
+  }
+}
+
+async function sendDeviceOtp(fan, deviceId, recaptchaToken) {
+  if (fan.lastOtpAt && Date.now() < new Date(fan.lastOtpAt).getTime() + 60_000) {
+    throw fail(429, "Wait a moment, then try again.");
+  }
+  const id = randomUUID();
+  let sessionInfo = "";
+  let value = "";
+  try {
+    const sent = await identity("accounts:sendVerificationCode", {
+      phoneNumber: e164(fan.phone),
+      ...(recaptchaToken ? { recaptchaToken } : {}),
+    });
+    sessionInfo = String(sent.sessionInfo || "");
+  } catch {
+    if (!usingEmulator()) throw fail(503, "Phone codes are not set up yet.");
+  }
+  if (usingEmulator()) {
+    value = (sessionInfo && (await emulatorPhoneCode(fan.phone))) || pin();
+    await rememberMail(fan.phone, "Your ticketID sign-in code", `Your ticketID code is ${value}\n`);
+  } else if (!sessionInfo) {
+    throw fail(503, "Phone codes are not set up yet.");
+  }
+  await db.collection("deviceChallenges").doc(id).set({
+    fanId: fan.id,
+    deviceKey: deviceKey(deviceId),
+    sessionInfo: sessionInfo || null,
+    codeHash: value ? sha(value) : null,
+    expiresAt: new Date(Date.now() + otpTtlMs()).toISOString(),
+    tries: 0,
+    createdAt: new Date().toISOString(),
+  });
+  await db.collection("fans").doc(fan.id).update({ lastOtpAt: new Date().toISOString() });
+  return id;
+}
+
+async function confirmDeviceOtp(body) {
+  const id = String(body.challengeId ?? "").trim();
+  const value = String(body.code ?? "").trim();
+  if (!id || !value) throw fail(400, "Enter the code we sent to your phone.");
+  const row = await getDoc("deviceChallenges", id);
+  if (!row) throw fail(400, "That code has expired. Sign in again.");
+  if (row.expiresAt && new Date(row.expiresAt).getTime() <= Date.now()) {
+    await db.collection("deviceChallenges").doc(id).delete().catch(() => undefined);
+    throw fail(400, "That code has expired. Sign in again.");
+  }
+  if (row.tries >= 5) throw fail(429, "Wait a moment, then try again.");
+  if (deviceKey(body.deviceId) !== row.deviceKey) throw fail(400, "That phone could not be verified.");
+  let matched = false;
+  if (row.sessionInfo) {
+    try {
+      const signed = await identity("accounts:signInWithPhoneNumber", { sessionInfo: row.sessionInfo, code: value });
+      if (signed.localId && signed.localId !== row.fanId) {
+        await admin.auth().deleteUser(signed.localId).catch(() => undefined);
+      } else {
+        matched = true;
+      }
+    } catch {
+      matched = false;
+    }
+  }
+  if (!matched && row.codeHash && sameCode(sha(value), row.codeHash)) matched = true;
+  if (!matched) {
+    await db.collection("deviceChallenges").doc(id).update({ tries: (row.tries || 0) + 1 });
+    throw fail(401, "That code is not right.");
+  }
+  const fan = await getDoc("fans", row.fanId);
+  if (!fan || fan.emailVerified !== true) throw fail(403, "Confirm your email to continue.");
+  await assertFanDevice(body.deviceId, fan.id);
+  await db.collection("deviceChallenges").doc(id).delete().catch(() => undefined);
+  return sessionBody(await sessionFromUid(fan.id, "fan"));
+}
+
+async function createAuthUser(email, password, phone) {
+  const base = { email, password };
+  const withPhone = phone ? { ...base, phoneNumber: e164(phone) } : base;
+  try {
+    return await admin.auth().createUser(withPhone);
   } catch (error) {
     if (error.code === "auth/email-already-exists") throw fail(400, "That email is already registered.");
+    if (error.code === "auth/phone-number-already-exists") throw fail(400, "That phone number is already registered.");
+    if (phone && withPhone !== base) {
+      try {
+        return await admin.auth().createUser(base);
+      } catch (retry) {
+        if (retry.code === "auth/email-already-exists") throw fail(400, "That email is already registered.");
+        throw retry;
+      }
+    }
     throw error;
   }
 }
@@ -462,9 +792,10 @@ async function signupFan(body) {
   deviceKey(body.deviceId);
   const city = optionalPlace(body.city ?? body.hometown);
   const country = optionalPlace(body.country);
-  const user = await createAuthUser(email, password);
+  const user = await createAuthUser(email, password, phone);
   try {
     await reserveUsername(user.uid, username);
+    await reservePhone(user.uid, phone);
     await db.collection("fans").doc(user.uid).set({
       username,
       usernameLower: username.toLowerCase(),
@@ -475,15 +806,17 @@ async function signupFan(body) {
       country,
       placeKeys: placeKeys(city, country),
       registeredOnly: false,
+      emailVerified: false,
       createdAt: new Date().toISOString(),
     });
     await admin.auth().setCustomUserClaims(user.uid, { actor: "fan" });
     await assertFanDevice(body.deviceId, user.uid);
+    await sendVerifyEmail(user.uid, email, "fan");
   } catch (error) {
-    await rollbackAccount(user.uid, username);
+    await rollbackAccount(user.uid, username, phone);
     throw error;
   }
-  return sessionBody(await sessionWithActor(await signInWithPassword(email, password), "fan", "Sign in to continue."), { email });
+  return { email, needsVerify: true };
 }
 
 async function signupOrg(body) {
@@ -503,14 +836,16 @@ async function signupOrg(body) {
       name,
       email,
       profileImage: null,
+      emailVerified: false,
       createdAt: new Date().toISOString(),
     });
     await admin.auth().setCustomUserClaims(user.uid, { actor: "org" });
+    await sendVerifyEmail(user.uid, email, "org");
   } catch (error) {
     await rollbackAccount(user.uid);
     throw error;
   }
-  return sessionBody(await sessionWithActor(await signInWithPassword(email, password), "org", "Sign in to continue."), { email });
+  return { email, needsVerify: true };
 }
 
 async function loginAccount(body, actor) {
@@ -519,7 +854,30 @@ async function loginAccount(body, actor) {
   const decoded = await verifyToken(session.idToken);
   const record = await getDoc(actor === "fan" ? "fans" : "orgs", decoded.uid);
   if (!record) throw fail(401, "That email or password is wrong.");
-  if (actor === "fan") await assertFanDevice(body.deviceId, decoded.uid);
+  if (record.emailVerified !== true) {
+    try {
+      await sendVerifyEmail(record.id, record.email, actor);
+    } catch {
+      /* The person can send the email again from the confirm screen. */
+    }
+    return { needsVerify: true, email: record.email };
+  }
+  if (actor === "fan") {
+    const key = deviceKey(body.deviceId);
+    const bound = await getDoc("deviceBinds", key);
+    if (bound?.fanId === decoded.uid) {
+      await assertFanDevice(body.deviceId, decoded.uid);
+      return sessionBody(session);
+    }
+    if (bound && bound.fanId !== decoded.uid) {
+      const last = new Date(bound.lastSeenAt || bound.boundAt || 0).getTime();
+      if (Number.isFinite(last) && Date.now() < last + deviceLockMs()) {
+        throw fail(403, "This phone is already signed in to another account. You can use that account again, or wait before using a different one.");
+      }
+    }
+    const challengeId = await sendDeviceOtp(record, body.deviceId, body.recaptchaToken);
+    return { needsOtp: true, challengeId, phoneHint: phoneHint(record.phone) };
+  }
   return sessionBody(session);
 }
 
@@ -527,6 +885,14 @@ async function endReceiver(uid) {
   await admin.auth().revokeRefreshTokens(uid).catch(() => undefined);
   await admin.auth().deleteUser(uid).catch(() => undefined);
   await db.collection("receiverSessions").doc(uid).delete().catch(() => undefined);
+}
+
+async function closeGigDoors(gigId) {
+  if (!gigId) return;
+  await deleteWhere("scannerCodes", "gigId", gigId);
+  const sessions = await db.collection("receiverSessions").where("gigId", "==", gigId).get();
+  for (const item of sessions.docs) await endReceiver(item.id);
+  await db.collection("gigs").doc(gigId).update({ scannerCode: null }).catch(() => undefined);
 }
 
 async function logout(token) {
@@ -551,6 +917,7 @@ async function requireFan(token) {
   if (decoded.actor !== "fan") throw fail(401, "Sign in to continue.");
   const fan = await getDoc("fans", decoded.uid);
   if (!fan) throw fail(401, "Sign in to continue.");
+  if (fan.emailVerified !== true) throw fail(403, "Confirm your email to continue.");
   return fan;
 }
 
@@ -559,6 +926,7 @@ async function requireOrg(token) {
   if (decoded.actor !== "org") throw fail(401, "Sign in to continue.");
   const org = await getDoc("orgs", decoded.uid);
   if (!org) throw fail(401, "Sign in to continue.");
+  if (org.emailVerified !== true) throw fail(403, "Confirm your email to continue.");
   return org;
 }
 
@@ -573,7 +941,10 @@ async function requireReceiver(token) {
   }
   const gig = await getDoc("gigs", decoded.gigId);
   if (!gig || !gig.image) throw fail(401, "Sign in to the event again.");
-  if (gig.live !== true) throw fail(401, "This event is not live.");
+  if (gig.live !== true) {
+    await closeGigDoors(decoded.gigId);
+    throw fail(401, "This event is not live.");
+  }
   return gig;
 }
 
@@ -603,34 +974,35 @@ async function requireCurrentPassword(email, password) {
 
 async function updateFan(token, body) {
   const fan = await requireFan(token);
-  await requireCurrentPassword(fan.email, body.currentPassword);
   const username = body.username === undefined ? fan.username : String(body.username).trim();
   if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) throw fail(400, "Use a username of 3 to 20 letters, numbers, or underscores.");
   const phone = body.phone === undefined ? fan.phone : String(body.phone).trim();
   if (phoneKey(phone).length < 8) throw fail(400, "Enter a phone number.");
   let email = fan.email;
+  let pendingEmail = fan.pendingEmail || null;
   if (body.email !== undefined) {
-    email = cleanEmail(body.email);
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw fail(400, "Enter a valid email address.");
-    const taken = await db.collection("fans").where("email", "==", email).limit(1).get();
+    const next = cleanEmail(body.email);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(next)) throw fail(400, "Enter a valid email address.");
+    const taken = await db.collection("fans").where("email", "==", next).limit(1).get();
     if (!taken.empty && taken.docs[0].id !== fan.id) throw fail(400, "That email is already registered.");
+    if (next !== fan.email) {
+      pendingEmail = next;
+      await sendVerifyEmail(fan.id, next, "fan");
+    }
   }
   const city = body.city !== undefined ? optionalPlace(body.city) : body.hometown !== undefined ? optionalPlace(body.hometown) : fan.city;
   const country = body.country === undefined ? fan.country : optionalPlace(body.country);
   const registeredOnly = body.registeredOnly === undefined ? fan.registeredOnly === true : Boolean(body.registeredOnly);
   if (username.toLowerCase() !== fan.usernameLower) await reserveUsername(fan.id, username, fan.usernameLower);
-  if (email !== fan.email) {
-    try {
-      await admin.auth().updateUser(fan.id, { email });
-    } catch (error) {
-      if (error.code === "auth/email-already-exists") throw fail(400, "That email is already registered.");
-      throw error;
-    }
+  if (phoneKey(phone) !== fan.phoneKey) {
+    await reservePhone(fan.id, phone, fan.phoneKey);
+    await admin.auth().updateUser(fan.id, { phoneNumber: e164(phone) }).catch(() => undefined);
   }
   await db.collection("fans").doc(fan.id).update({
     username,
     usernameLower: username.toLowerCase(),
     email,
+    pendingEmail,
     phone,
     phoneKey: phoneKey(phone),
     city,
@@ -859,7 +1231,6 @@ async function refreshMember(org) {
 
 async function updateOrg(token, body) {
   const org = await requireOrg(token);
-  await requireCurrentPassword(org.email, body.currentPassword);
   const name = body.name === undefined ? org.name : String(body.name).trim();
   if (!name) throw fail(400, "Enter a name.");
   const kinds = ["band", "team", "ensemble", "organiser", "venue", "festival"];
@@ -900,7 +1271,7 @@ async function listGigs(token) {
   const org = await requireOrg(token);
   const rows = await gigsForOrg(org.id);
   rows.sort((left, right) => String(right.startsAt || right.createdAt || "").localeCompare(String(left.startsAt || left.createdAt || "")));
-  return rows.map((gig) => gigView(gig, org.id));
+  return Promise.all(rows.map((gig) => gigView(gig, org.id)));
 }
 
 function eventStart(dateValue, timeValue) {
@@ -987,6 +1358,14 @@ async function goLive(token, gigId) {
   return gigView(await getDoc("gigs", gig.id), org.id);
 }
 
+async function endLive(token, gigId) {
+  const org = await requireOrg(token);
+  const gig = assertCreator(org.id, await assertOnGig(org.id, gigId));
+  await closeGigDoors(gig.id);
+  if (gig.live === true) await db.collection("gigs").doc(gig.id).update({ live: false, scannerCode: null });
+  return gigView(await getDoc("gigs", gig.id), org.id);
+}
+
 async function scannerCode(token, gigId) {
   const org = await requireOrg(token);
   const gig = assertCreator(org.id, await assertOnGig(org.id, gigId));
@@ -995,10 +1374,11 @@ async function scannerCode(token, gigId) {
     const old = await db.collection("scannerCodes").doc(gig.scannerCode).get();
     if (old.exists && !old.data().usedAt) await old.ref.delete();
   }
+  const expiresAt = new Date(Date.now() + scannerTtlMs()).toISOString();
   let value = code(8);
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
-      await db.collection("scannerCodes").doc(value).create({ gigId: gig.id, usedAt: null });
+      await db.collection("scannerCodes").doc(value).create({ gigId: gig.id, usedAt: null, expiresAt });
       break;
     } catch (error) {
       value = code(8);
@@ -1006,18 +1386,16 @@ async function scannerCode(token, gigId) {
     }
   }
   await db.collection("gigs").doc(gig.id).update({ scannerCode: value });
-  return { code: value, qr: await scannerQr(value) };
+  return { code: value, qr: await scannerQr(value), expiresAt };
 }
 
 async function deleteGig(token, gigId) {
   const org = await requireOrg(token);
   const gig = assertCreator(org.id, await assertOnGig(org.id, gigId));
   if (gig.startsAt && gig.live === true) throw fail(409, "A live event with a date cannot be deleted.");
+  await closeGigDoors(gig.id);
   await deleteWhere("registrations", "gigId", gig.id);
   await deleteWhere("checkins", "gigId", gig.id);
-  await deleteWhere("scannerCodes", "gigId", gig.id);
-  const sessions = await db.collection("receiverSessions").where("gigId", "==", gig.id).get();
-  for (const item of sessions.docs) await endReceiver(item.id);
   await db.collection("gigs").doc(gig.id).delete();
   return { ok: true };
 }
@@ -1145,7 +1523,7 @@ async function groupName(group) {
   const given = String(group?.label ?? "").trim();
   if (given) return given;
   const type = String(group?.type ?? group?.group ?? "");
-  if (type === "all" || type === "everyone") return "All fans";
+  if (type === "all" || type === "everyone") return "Everyone who has registered with you";
   if (type === "events" || type === "gig") {
     const ids = group.gigIds || (group.gigId ? [group.gigId] : []);
     const names = [];
@@ -1384,6 +1762,13 @@ async function notifyFans(fans, title, body) {
   }
 }
 
+async function previewSend(token, body) {
+  const org = await requireOrg(token);
+  if (!Array.isArray(body.groups) || !body.groups.length) return { count: 0 };
+  const { fans } = await fansForSend(org, body);
+  return { count: fans.length };
+}
+
 async function issuedCodes(token) {
   const org = await requireOrg(token);
   const snap = await db.collection("priorityCodes").where("orgId", "==", org.id).get();
@@ -1531,19 +1916,34 @@ async function receiverLogin(body) {
   const value = (packed ? packed[1] : raw).toUpperCase();
   const ref = value ? db.collection("scannerCodes").doc(value) : null;
   let gigId = "";
+  let notLive = false;
   if (!ref) throw fail(401, "That scanner code was not found.");
-  await db.runTransaction(async (tx) => {
-    const row = await tx.get(ref);
-    if (!row.exists) throw fail(401, "That scanner code was not found.");
-    if (row.data().usedAt) throw fail(401, "That scanner code has already been used.");
-    const gigSnap = await tx.get(db.collection("gigs").doc(row.data().gigId));
-    const gig = gigSnap.exists ? gigSnap.data() : null;
-    if (!gig || gig.live !== true) throw fail(409, "This event is not live yet.");
-    if (!gigReady(gig)) throw fail(409, "Add a name, date, and image before check-in.");
-    gigId = gigSnap.id;
-    tx.update(ref, { usedAt: new Date().toISOString() });
-    tx.update(gigSnap.ref, { scannerCode: null });
-  });
+  try {
+    await db.runTransaction(async (tx) => {
+      const row = await tx.get(ref);
+      if (!row.exists) throw fail(401, "That scanner code was not found.");
+      if (row.data().usedAt) throw fail(401, "That scanner code has already been used.");
+      gigId = row.data().gigId;
+      const gigSnap = await tx.get(db.collection("gigs").doc(gigId));
+      const gig = gigSnap.exists ? gigSnap.data() : null;
+      if (!gig || gig.live !== true) {
+        notLive = true;
+        throw fail(409, "This event is not live.");
+      }
+      if (!gigReady(gig)) throw fail(409, "Add a name, date, and image before check-in.");
+      const expiresAt = row.data().expiresAt;
+      if (!expiresAt || new Date(expiresAt).getTime() <= Date.now()) {
+        tx.delete(ref);
+        if (gig.scannerCode === value) tx.update(gigSnap.ref, { scannerCode: null });
+        throw fail(401, "That scanner code has expired.");
+      }
+      tx.update(ref, { usedAt: new Date().toISOString() });
+      tx.update(gigSnap.ref, { scannerCode: null });
+    });
+  } catch (error) {
+    if (notLive && gigId) await closeGigDoors(gigId);
+    throw error;
+  }
   try {
     const session = await openReceiverSession(gigId);
     const gig = await getDoc("gigs", gigId);
@@ -1599,6 +1999,20 @@ async function handle(request, response) {
   if (path.startsWith("/api/fan/") && path !== "/api/fan/recover" && path !== "/api/fan/recover/confirm") {
     await requireAppCheck(request);
   }
+  const limited = new Set([
+    "/api/fan/signup",
+    "/api/org/signup",
+    "/api/fan/login",
+    "/api/fan/login/otp",
+    "/api/org/login",
+    "/api/verify",
+    "/api/resend",
+    "/api/fan/recover",
+    "/api/fan/recover/confirm",
+  ]);
+  if (request.method === "POST" && limited.has(path)) {
+    await enforceRateLimit(`${clientIp(request)}:${path}`);
+  }
   if (request.method === "GET" && path.startsWith("/media/")) return sendMedia(response, path.slice("/media/".length));
   if (request.method === "GET" && path === "/api/health") {
     return { ok: true };
@@ -1606,9 +2020,10 @@ async function handle(request, response) {
   if (request.method === "POST" && path === "/api/session/refresh") return exchangeRefresh(String(body.refreshToken || ""));
   if (request.method === "POST" && path === "/api/fan/signup") return signupFan(body);
   if (request.method === "POST" && path === "/api/org/signup") return signupOrg(body);
-  if (request.method === "POST" && path === "/api/verify") return { ok: true, actor: body.actor === "org" ? "org" : "fan" };
-  if (request.method === "POST" && path === "/api/resend") return { ok: true };
+  if (request.method === "POST" && path === "/api/verify") return confirmEmail(body);
+  if (request.method === "POST" && path === "/api/resend") return resendVerify(body);
   if (request.method === "POST" && path === "/api/fan/login") return loginAccount(body, "fan");
+  if (request.method === "POST" && path === "/api/fan/login/otp") return confirmDeviceOtp(body);
   if (request.method === "POST" && path === "/api/org/login") return loginAccount(body, "org");
   if (request.method === "POST" && path === "/api/logout") return logout(token);
   if (request.method === "GET" && path === "/api/fan/me") return publicFan(await requireFan(token));
@@ -1633,6 +2048,7 @@ async function handle(request, response) {
   if (request.method === "PATCH" && /^\/api\/gigs\/[^/]+$/.test(path)) return updateGig(token, path.split("/")[3], body);
   if (request.method === "DELETE" && /^\/api\/gigs\/[^/]+$/.test(path)) return deleteGig(token, path.split("/")[3]);
   if (request.method === "POST" && /^\/api\/gigs\/[^/]+\/live$/.test(path)) return goLive(token, path.split("/")[3]);
+  if (request.method === "DELETE" && /^\/api\/gigs\/[^/]+\/live$/.test(path)) return endLive(token, path.split("/")[3]);
   if (request.method === "POST" && /^\/api\/gigs\/[^/]+\/scanner$/.test(path)) return scannerCode(token, path.split("/")[3]);
   if (request.method === "GET" && /^\/api\/gigs\/[^/]+\/receivers$/.test(path)) return listReceivers(token, path.split("/")[3]);
   if (request.method === "DELETE" && /^\/api\/gigs\/[^/]+\/receivers\/[^/]+$/.test(path)) {
@@ -1644,6 +2060,7 @@ async function handle(request, response) {
   if (request.method === "POST" && /^\/api\/gigs\/[^/]+\/members$/.test(path)) return addMember(token, path.split("/")[3], body, "member");
   if (request.method === "GET" && path === "/api/groups") return groupPreview(token, request.query || {});
   if (request.method === "GET" && path === "/api/places") return orgPlaces(token);
+  if (request.method === "POST" && path === "/api/codes/preview") return previewSend(token, body);
   if (request.method === "GET" && /^\/api\/codes\/[^/]+$/.test(path)) return sendReleaseCsv(response, token, path.split("/")[3]);
   if (request.method === "GET" && path === "/api/codes") return issuedCodes(token);
   if (request.method === "POST" && path === "/api/codes") return sendCodes(token, body);

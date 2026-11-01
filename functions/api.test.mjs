@@ -41,23 +41,48 @@ async function mailCode(base, email) {
   return decodeURIComponent(found[1]);
 }
 
+async function mailPin(base, to) {
+  const message = await call(base, `/api/dev/mail?email=${encodeURIComponent(to)}`);
+  const found = String(message.data.body || "").match(/Your ticketID code is (\d{6})/);
+  assert.ok(found, message.data.body);
+  return found[1];
+}
+
+async function confirmMail(base, email, actor = "fan") {
+  const code = await mailPin(base, email);
+  const verified = await call(base, "/api/verify", { method: "POST", body: { actor, email, code } });
+  assert.equal(verified.status, 200, JSON.stringify(verified.data));
+  return verified.data;
+}
+
+function phoneFor(email) {
+  const digits = sha(email).replace(/\D/g, "").padEnd(10, "0").slice(0, 10);
+  return `07${digits}`;
+}
+
 async function fan(base, details) {
   const deviceId = details.deviceId || randomUUID();
-  const signup = await call(base, "/api/fan/signup", { method: "POST", body: { password: "Password1!", confirm: "Password1!", phone: "07000000000", ...details, deviceId } });
+  const phone = details.phone || phoneFor(details.email);
+  const signup = await call(base, "/api/fan/signup", { method: "POST", body: { password: "Password1!", confirm: "Password1!", phone, ...details, deviceId } });
   assert.equal(signup.status, 200, JSON.stringify(signup.data));
-  assert.ok(signup.data.token);
+  assert.equal(signup.data.needsVerify, true);
+  assert.equal(signup.data.token, undefined);
+  await confirmMail(base, details.email, "fan");
   const logged = await call(base, "/api/fan/login", { method: "POST", body: { email: details.email, password: "Password1!", deviceId } });
-  assert.equal(logged.status, 200);
+  assert.equal(logged.status, 200, JSON.stringify(logged.data));
+  assert.ok(logged.data.token);
   return logged.data.token;
 }
 
 async function org(base, details) {
   const signup = await call(base, "/api/org/signup", { method: "POST", body: { password: "Password1!", confirm: "Password1!", ...details } });
-  assert.equal(signup.status, 200);
-  assert.ok(signup.data.token);
+  assert.equal(signup.status, 200, JSON.stringify(signup.data));
+  assert.equal(signup.data.needsVerify, true);
+  assert.equal(signup.data.token, undefined);
+  await confirmMail(base, details.email, "org");
   const logged = await call(base, "/api/org/login", { method: "POST", body: { email: details.email, password: "Password1!" } });
-  assert.equal(logged.status, 200);
-  const picture = await call(base, "/api/org/me", { method: "PATCH", token: logged.data.token, body: { profileImage: png, currentPassword: "Password1!" } });
+  assert.equal(logged.status, 200, JSON.stringify(logged.data));
+  const picture = await call(base, "/api/org/me", { method: "PATCH", token: logged.data.token, body: { profileImage: png } });
   assert.equal(picture.status, 200, JSON.stringify(picture.data));
   return logged.data.token;
 }
@@ -70,13 +95,27 @@ test("a fan can register and sign in with email and password", async () => {
   const deviceId = randomUUID();
   const signup = await call(started.url, "/api/fan/signup", { method: "POST", body: { username: "ada", email: "ada@example.com", phone: "07000900000", password: "Password1!", confirm: "Password1!", deviceId } });
   assert.equal(signup.status, 200, JSON.stringify(signup.data));
+  assert.equal(signup.data.needsVerify, true);
+  assert.equal(signup.data.token, undefined);
+  const closed = await call(started.url, "/api/fan/me");
+  assert.equal(closed.status, 401);
+  const before = await call(started.url, "/api/fan/login", { method: "POST", body: { email: "ada@example.com", password: "Password1!", deviceId } });
+  assert.equal(before.status, 200, JSON.stringify(before.data));
+  assert.equal(before.data.needsVerify, true);
+  assert.equal(before.data.token, undefined);
+  await confirmMail(started.url, "ada@example.com");
   const me = await call(started.url, "/api/fan/me", { token: signup.data.token });
-  assert.equal(me.status, 200, JSON.stringify(me.data));
-  assert.equal(me.data.email, "ada@example.com");
+  assert.equal(me.status, 401);
   const logged = await call(started.url, "/api/fan/login", { method: "POST", body: { email: "ada@example.com", password: "Password1!", deviceId } });
   assert.equal(logged.status, 200, JSON.stringify(logged.data));
+  const profile = await call(started.url, "/api/fan/me", { token: logged.data.token });
+  assert.equal(profile.status, 200, JSON.stringify(profile.data));
+  assert.equal(profile.data.email, "ada@example.com");
+  assert.equal(profile.data.emailVerified, true);
   const wrong = await call(started.url, "/api/fan/login", { method: "POST", body: { email: "ada@example.com", password: "nope" } });
   assert.equal(wrong.status, 401);
+  const taken = await call(started.url, "/api/fan/signup", { method: "POST", body: { username: "ada2", email: "ada2@example.com", phone: "07000900000", password: "Password1!", confirm: "Password1!", deviceId: randomUUID() } });
+  assert.equal(taken.status, 400);
   } finally {
     await shutdown(started);
   }
@@ -93,7 +132,6 @@ test("a scan proves a fan and a priority code reaches only that account", async 
     token: venue,
     body: {
       profileImage: "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
-      currentPassword: "Password1!",
     },
   });
   assert.equal(labeled.status, 400);
@@ -102,8 +140,8 @@ test("a scan proves a fan and a priority code reaches only that account", async 
   const fanToken = await fan(started.url, { username: "mina", email: "mina@example.com", hometown: "Hackney", city: "London" });
   const opted = await fan(started.url, { username: "otto", email: "otto@example.com", city: "London" });
   const unlocked = await call(started.url, "/api/fan/me", { method: "PATCH", token: opted, body: { registeredOnly: true } });
-  assert.equal(unlocked.status, 401);
-  await call(started.url, "/api/fan/me", { method: "PATCH", token: opted, body: { registeredOnly: true, currentPassword: "Password1!" } });
+  assert.equal(unlocked.status, 200, JSON.stringify(unlocked.data));
+  assert.equal(unlocked.data.registeredOnly, true);
 
   const created = await call(started.url, "/api/gigs", { method: "POST", token: venue, body: {} });
   const gigId = created.data.id;
@@ -159,6 +197,17 @@ test("a scan proves a fan and a priority code reaches only that account", async 
   const status = await call(started.url, `/api/fan/checkin/${minted.data.id}`, { token: fanToken });
   assert.equal(status.data.status, "registered");
   assert.equal(status.data.gigName, "Night Bus at The Room");
+  const counted = await call(started.url, `/api/gigs/${gigId}`, { token: venue });
+  assert.equal(counted.data.registered, 1);
+  const catalogue = await call(started.url, "/api/gigs", { token: venue });
+  assert.equal(catalogue.data.find((item) => item.id === gigId).registered, 1);
+  const preview = await call(started.url, "/api/codes/preview", {
+    method: "POST",
+    token: band,
+    body: { groups: [{ type: "events", gigIds: [gigId] }] },
+  });
+  assert.equal(preview.status, 200, JSON.stringify(preview.data));
+  assert.equal(preview.data.count, 1);
 
   process.env.CHECKIN_MS = "250";
   const expiredMint = await call(started.url, "/api/fan/checkin", { method: "POST", token: opted, body: {} });
@@ -266,7 +315,7 @@ test("a fan changes a password and can recover it by email or phone", async () =
   const again = await call(started.url, "/api/fan/login", { method: "POST", body: { email: "ada@example.com", password: "Password3!", deviceId } });
   assert.equal(again.status, 200);
 
-  const saved = await call(started.url, "/api/fan/me", { method: "PATCH", token: again.data.token, body: { city: "London", country: "United Kingdom", email: "ada@example.com", currentPassword: "Password3!" } });
+  const saved = await call(started.url, "/api/fan/me", { method: "PATCH", token: again.data.token, body: { city: "London", country: "United Kingdom", email: "ada@example.com" } });
   assert.equal(saved.status, 200);
   assert.equal(saved.data.city, "London");
   assert.equal(saved.data.country, "United Kingdom");
@@ -371,5 +420,88 @@ test("a scanner session expires", async () => {
     await shutdown(started);
     if (previous === undefined) delete process.env.RECEIVER_MS;
     else process.env.RECEIVER_MS = previous;
+  }
+});
+
+test("a new device needs a phone code after email is confirmed", async () => {
+  const started = await boot();
+  try {
+    const firstDevice = randomUUID();
+    await fan(started.url, { username: "ada", email: "ada-otp@example.com", phone: "07000900011", deviceId: firstDevice });
+    const nextDevice = randomUUID();
+    const challenge = await call(started.url, "/api/fan/login", { method: "POST", body: { email: "ada-otp@example.com", password: "Password1!", deviceId: nextDevice } });
+    assert.equal(challenge.status, 200, JSON.stringify(challenge.data));
+    assert.equal(challenge.data.needsOtp, true);
+    assert.equal(challenge.data.token, undefined);
+    assert.ok(challenge.data.challengeId);
+    const wrong = await call(started.url, "/api/fan/login/otp", { method: "POST", body: { challengeId: challenge.data.challengeId, code: "000000", deviceId: nextDevice } });
+    assert.equal(wrong.status, 401);
+    const pin = await mailPin(started.url, "07000900011");
+    const otherPhone = await call(started.url, "/api/fan/login/otp", { method: "POST", body: { challengeId: challenge.data.challengeId, code: pin, deviceId: randomUUID() } });
+    assert.equal(otherPhone.status, 400);
+    const passed = await call(started.url, "/api/fan/login/otp", { method: "POST", body: { challengeId: challenge.data.challengeId, code: pin, deviceId: nextDevice } });
+    assert.equal(passed.status, 200, JSON.stringify(passed.data));
+    assert.ok(passed.data.token);
+    const again = await call(started.url, "/api/fan/login", { method: "POST", body: { email: "ada-otp@example.com", password: "Password1!", deviceId: nextDevice } });
+    assert.equal(again.status, 200, JSON.stringify(again.data));
+    assert.ok(again.data.token);
+    assert.equal(again.data.needsOtp, undefined);
+  } finally {
+    await shutdown(started);
+  }
+});
+
+test("sign-in is limited to five tries in fifteen minutes", async () => {
+  const started = await boot();
+  try {
+    const deviceId = randomUUID();
+    await fan(started.url, { username: "rate", email: "rate@example.com", phone: "07000900022", deviceId });
+    for (let index = 0; index < 4; index += 1) {
+      const logged = await call(started.url, "/api/fan/login", { method: "POST", body: { email: "rate@example.com", password: "Password1!", deviceId } });
+      assert.equal(logged.status, 200, JSON.stringify(logged.data));
+    }
+    const blocked = await call(started.url, "/api/fan/login", { method: "POST", body: { email: "rate@example.com", password: "Password1!", deviceId } });
+    assert.equal(blocked.status, 429);
+  } finally {
+    await shutdown(started);
+  }
+});
+
+test("an unused scanner code expires and ending check-in signs doors out", async () => {
+  const previous = process.env.SCANNER_MS;
+  process.env.SCANNER_MS = "2500";
+  const started = await boot();
+  try {
+    const venue = await org(started.url, { kind: "venue", name: "The Room", email: "door-end@example.com" });
+    const created = await call(started.url, "/api/gigs", { method: "POST", token: venue, body: {} });
+    const gigId = created.data.id;
+    const saved = await call(started.url, `/api/gigs/${gigId}`, {
+      method: "PATCH",
+      token: venue,
+      body: { name: "Close night", date: "2026-11-02", time: "20:00", image: png },
+    });
+    assert.equal(saved.status, 200, JSON.stringify(saved.data));
+    await call(started.url, `/api/gigs/${gigId}/live`, { method: "POST", token: venue, body: {} });
+    const first = await call(started.url, `/api/gigs/${gigId}/scanner`, { method: "POST", token: venue, body: {} });
+    assert.equal(first.status, 200, JSON.stringify(first.data));
+    assert.ok(first.data.expiresAt);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const stale = await call(started.url, "/api/receiver/login", { method: "POST", body: { code: first.data.code } });
+    assert.equal(stale.status, 401);
+
+    const second = await call(started.url, `/api/gigs/${gigId}/scanner`, { method: "POST", token: venue, body: {} });
+    const receiver = await call(started.url, "/api/receiver/login", { method: "POST", body: { code: second.data.code } });
+    assert.equal(receiver.status, 200);
+    const ended = await call(started.url, `/api/gigs/${gigId}/live`, { method: "DELETE", token: venue });
+    assert.equal(ended.status, 200);
+    assert.equal(ended.data.live, false);
+    const closed = await call(started.url, "/api/receiver/event", { token: receiver.data.token });
+    assert.equal(closed.status, 401);
+    const leftover = await call(started.url, `/api/gigs/${gigId}/scanner`, { method: "POST", token: venue, body: {} });
+    assert.equal(leftover.status, 409);
+  } finally {
+    await shutdown(started);
+    if (previous === undefined) delete process.env.SCANNER_MS;
+    else process.env.SCANNER_MS = previous;
   }
 });
